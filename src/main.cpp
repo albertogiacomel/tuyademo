@@ -5,7 +5,7 @@
  * Target MCU: STM32F103C8T6 (72MHz ARM Cortex-M3)
  * Exact Pinout reverse-engineered from factory firmware:
  * - Status LEDs (Active Low): PB6 (LED1), PB5 (LED2)
- * - RGB LED (Active Low PWM on TIM4): PB8 (Red), PB7 (Green), PB9 (Blue)
+ * - RGB LED (Active Low PWM on TIM4): PB8 (Red), PB9 (Green), PB7 (Blue)
  * - User Buttons (Active Low): PA11 (Key1), PA12 (Key2)
  * - Serial: PA9/PA10 (USART1), PB10/PB11 (USART3)
  */

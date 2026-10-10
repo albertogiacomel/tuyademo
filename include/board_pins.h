@@ -28,9 +28,9 @@
 #define PIN_LED2          PB5   // LED2 (MCU Status / Heartbeat Indicator)
 
 // --- On-Board RGB LED (RGB彩灯 - Active Low: LOW = ON, HIGH = OFF) ---
-#define PIN_RGB_RED       PB8   // Red Channel
-#define PIN_RGB_GREEN     PB7   // Green Channel
-#define PIN_RGB_BLUE      PB9   // Blue Channel
+#define PIN_RGB_RED       PB8   // Red Channel (TIM4_CH3)
+#define PIN_RGB_GREEN     PB9   // Green Channel (TIM4_CH4 - Hardware verified)
+#define PIN_RGB_BLUE      PB7   // Blue Channel (TIM4_CH2 - Hardware verified)
 
 // --- On-Board User Push Buttons (Active Low with Pull-Up: LOW = Pressed) ---
 #define PIN_KEY1          PA11  // 按键1: Mode / Toggle / Pairing Trigger
