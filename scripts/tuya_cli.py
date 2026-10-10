@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""tuya_cli.py - Master CLI for Tuya TYDE 3.0 IoT Development Board.
+
+Refactored to Cyclopts following SOUL_GLOBAL / QwenPaw / CoPaw methodology:
+- Cyclopts App & Annotated parameters (R-QCLI / canonical CLI architecture)
+- Explicit UTF-8 encoding (R49)
+- Structured error handling (R67)
+- Zero broken code & zero warnings (R58, R24)
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Annotated
+
+import serial
+from cyclopts import App, Parameter
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+FIRMWARE_DIR = BASE_DIR / "firmware"
+DEFAULT_PORT = "COM3"
+DEFAULT_BAUD = 115200
+
+app = App(
+    name="tuya-cli",
+    help="Tuya TYDE 3.0 Board Toolchain CLI (SOUL_GLOBAL compliant, Cyclopts-powered)",
+)
+
+
+def get_timestamp() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+@app.command
+def ping(
+    port: Annotated[
+        str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
+    ] = DEFAULT_PORT,
+    baud: Annotated[
+        int, Parameter(name=["-b", "--baud"], help="Baud rate")
+    ] = DEFAULT_BAUD,
+    timeout: Annotated[
+        float, Parameter(name=["-t", "--timeout"], help="Timeout in secondi")
+    ] = 0.5,
+) -> None:
+    """Invia il byte diagnostico '?' allo Smart Bridge STM32 e attende 'OK\\n'."""
+    print(
+        f"[{get_timestamp()}] Inviando ping diagnostico '?' su {port} ({baud} baud)..."
+    )
+    try:
+        with serial.Serial(port, baud, timeout=timeout) as ser:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            ser.write(b"?")
+            ser.flush()
+            time.sleep(0.05)
+            resp = ser.read(16)
+            if resp == b"OK\n" or b"OK" in resp:
+                print(
+                    f"[+] SUCCESSO: STM32 Smart Bridge attivo e rispondente! Risposta: {resp!r}"
+                )
+            elif resp:
+                print(f"[!] RICEVUTO DATO IMPREVISTO: {resp!r} (HEX: {resp.hex()})")
+                sys.exit(1)
+            else:
+                print(
+                    "[-] NESSUNA RISPOSTA: verificare alimentazione, ponticelli P2 o riavviare con MCU RST."
+                )
+                sys.exit(1)
+    except (serial.SerialException, OSError) as exc:
+        print(f"[-] Errore apertura porta seriale {port}: {exc}")
+        sys.exit(2)
+
+
+@app.command
+def listen(
+    port: Annotated[
+        str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
+    ] = DEFAULT_PORT,
+    baud: Annotated[
+        int, Parameter(name=["-b", "--baud"], help="Baud rate")
+    ] = DEFAULT_BAUD,
+    duration: Annotated[
+        float, Parameter(name=["-d", "--duration"], help="Durata in secondi")
+    ] = 15.0,
+) -> None:
+    """Monitor seriale passivo: cattura e decodifica tutti i frame ricevuti."""
+    print(
+        f"[{get_timestamp()}] In ascolto su {port} ({baud} baud) per {duration} secondi..."
+    )
+    try:
+        with serial.Serial(port, baud, timeout=0.1) as ser:
+            ser.reset_input_buffer()
+            t0 = time.time()
+            total_bytes = 0
+            while time.time() - t0 < duration:
+                data = ser.read(128)
+                if data:
+                    total_bytes += len(data)
+                    ts = datetime.now(UTC).strftime("%H:%M:%S.%f")[:-3]
+                    print(
+                        f"[{ts}] +{len(data):3d}B | HEX: {data.hex():40s} | ASCII: {data!r}"
+                    )
+            print(
+                f"[{get_timestamp()}] Ascolto terminato. Totale byte ricevuti: {total_bytes}"
+            )
+    except (serial.SerialException, OSError) as exc:
+        print(f"[-] Errore porta {port}: {exc}")
+        sys.exit(2)
+
+
+@app.command
+def heartbeat(
+    port: Annotated[
+        str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
+    ] = DEFAULT_PORT,
+    baud: Annotated[
+        int, Parameter(name=["-b", "--baud"], help="Baud rate")
+    ] = DEFAULT_BAUD,
+) -> None:
+    """Invia frame Tuya MCU SDK Heartbeat standard (55AA00000000FF) a TYWE1S."""
+    frame = bytes.fromhex("55AA00000000FF")
+    print(f"[{get_timestamp()}] Invio Tuya MCU Heartbeat ({frame.hex()}) su {port}...")
+    try:
+        with serial.Serial(port, baud, timeout=1.0) as ser:
+            ser.reset_input_buffer()
+            ser.write(frame)
+            ser.flush()
+            resp = ser.read(128)
+            if resp:
+                print(
+                    f"[+] Ricevuti {len(resp)} byte in risposta: HEX={resp.hex()} | {resp!r}"
+                )
+            else:
+                print("[-] Nessuna risposta ricevuta dal modulo Wi-Fi.")
+                sys.exit(1)
+    except (serial.SerialException, OSError) as exc:
+        print(f"[-] Errore: {exc}")
+        sys.exit(2)
+
+
+@app.command(name="flash-bridge")
+def flash_bridge(
+    port: Annotated[
+        str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
+    ] = DEFAULT_PORT,
+) -> None:
+    """Carica il firmware Smart Bridge su STM32 via stm32loader."""
+    bin_file = FIRMWARE_DIR / "stm32_uart_smart_bridge.bin"
+    if not bin_file.exists():
+        print(f"[-] File binario non trovato: {bin_file}")
+        sys.exit(1)
+    cmd = [
+        sys.executable,
+        "-m",
+        "stm32loader",
+        "-p",
+        port,
+        "-f",
+        "F1",
+        "-e",
+        "-w",
+        "-v",
+        str(bin_file),
+    ]
+    print(f"[{get_timestamp()}] Esecuzione flash ponte STM32: {' '.join(cmd)}")
+    res = subprocess.run(cmd, check=False)
+    if res.returncode != 0:
+        sys.exit(res.returncode)
+
+
+@app.command(name="restore-factory")
+def restore_factory(
+    port: Annotated[
+        str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
+    ] = DEFAULT_PORT,
+) -> None:
+    """Ripristina il firmware di fabbrica originale Tuya su STM32."""
+    bin_file = FIRMWARE_DIR / "stm32_factory_tuya_backup.bin"
+    if not bin_file.exists():
+        print(f"[-] File backup di fabbrica non trovato: {bin_file}")
+        sys.exit(1)
+    cmd = [
+        sys.executable,
+        "-m",
+        "stm32loader",
+        "-p",
+        port,
+        "-f",
+        "F1",
+        "-e",
+        "-w",
+        "-v",
+        str(bin_file),
+    ]
+    print(f"[{get_timestamp()}] Ripristino firmware di fabbrica Tuya su STM32...")
+    res = subprocess.run(cmd, check=False)
+    if res.returncode != 0:
+        sys.exit(res.returncode)
+
+
+@app.command(name="backup-esp")
+def backup_esp(
+    port: Annotated[
+        str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
+    ] = DEFAULT_PORT,
+    baud: Annotated[
+        int, Parameter(name=["-b", "--baud"], help="Baud rate")
+    ] = DEFAULT_BAUD,
+    attempts: Annotated[
+        int, Parameter(name=["-a", "--attempts"], help="Tentativi di connessione")
+    ] = 30,
+) -> None:
+    """Esegue dump completo di 2 MiB della memoria flash del TYWE1S via esptool."""
+    out_file = FIRMWARE_DIR / "tywe1s_factory_tuya_backup.bin"
+    cmd = [
+        sys.executable,
+        "-m",
+        "esptool",
+        "-p",
+        port,
+        "-c",
+        "esp8266",
+        "-b",
+        str(baud),
+        "--before",
+        "no-reset",
+        "-a",
+        "no-reset",
+        "--connect-attempts",
+        str(attempts),
+        "read_flash",
+        "0",
+        "0x200000",
+        str(out_file),
+    ]
+    print(
+        f"[{get_timestamp()}] Avvio backup flash TYWE1S (ESP8266, 2 MiB) su {out_file}..."
+    )
+    print(
+        ">>> SUGGERIMENTO: Mentre esptool tenta la connessione, tieni premuto WIFI BOOT e clicca WIFI RST!"
+    )
+    res = subprocess.run(cmd, check=False)
+    if res.returncode != 0:
+        sys.exit(res.returncode)
+
+
+if __name__ == "__main__":
+    app()

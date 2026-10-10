@@ -1,0 +1,6 @@
+cyclopts>=5.2.0
+pyserial>=3.5
+esptool>=5.5.0
+stm32loader>=0.7.1
+keystone-engine>=0.9.2
+capstone>=5.0.9
