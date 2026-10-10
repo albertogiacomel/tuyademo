@@ -130,7 +130,13 @@ class BoardBridge:
                 ser.reset_input_buffer()
                 ser.write(b"T")
                 ser.flush()
-                line = ser.readline().decode("ascii", errors="replace").strip()
+                line = ""
+                t_wait = time.time()
+                while time.time() - t_wait < 0.4:
+                    cand = ser.readline().decode("ascii", errors="replace").strip()
+                    if cand.startswith("T:") and ",V:" in cand:
+                        line = cand
+                        break
                 latency = round((time.time() - t0) * 1000, 1)
                 # Format: T:XXXX,V:YYYY,VDD:3.29V,TEMP:35.9C
                 if line.startswith("T:") and ",V:" in line:
@@ -172,7 +178,18 @@ class BoardBridge:
                     cmd_str += "\n"
                 ser.write(cmd_str.encode("ascii"))
                 ser.flush()
-                resp = ser.readline().decode("ascii", errors="replace").strip()
+                t_wait = time.time()
+                resp = ""
+                while time.time() - t_wait < 0.4:
+                    cand = ser.readline().decode("ascii", errors="replace").strip()
+                    if not cand:
+                        continue
+                    resp = cand
+                    if any(
+                        k in cand
+                        for k in ("OK", "ERR", "RGB:", "LED:", "WIFI:", "CONFIG")
+                    ):
+                        break
                 self.status["online"] = True
                 self.status["last_seen"] = datetime.now(UTC).isoformat()
                 return resp
@@ -1915,6 +1932,8 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
         btn.disabled = false;
         btn.innerText = '🚀 Invia Configurazione al Tuya (Push Wi-Fi & Salva)';
       }
+    }
+
     async function disconnectWifiLan() {
       const btn = document.getElementById('btnDisconnectWifi');
       const msg = document.getElementById('disconnectMsg');
