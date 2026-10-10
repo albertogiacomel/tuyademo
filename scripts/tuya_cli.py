@@ -150,6 +150,76 @@ def read_temp(
         sys.exit(2)
 
 
+@app.command(name="rgb")
+def rgb(
+    color: Annotated[
+        str | None,
+        Parameter(
+            name=["-c", "--color"],
+            help="Colore predefinito (red, green, blue, yellow, cyan, magenta, white, off, temp, rainbow)",
+        ),
+    ] = None,
+    r: Annotated[
+        int | None, Parameter(name=["-r"], help="Canale Rosso PWM (0-255)")
+    ] = None,
+    g: Annotated[
+        int | None, Parameter(name=["-g"], help="Canale Verde PWM (0-255)")
+    ] = None,
+    b: Annotated[
+        int | None, Parameter(name=["-b"], help="Canale Blu PWM (0-255)")
+    ] = None,
+    port: Annotated[
+        str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
+    ] = DEFAULT_PORT,
+    baud: Annotated[
+        int, Parameter(name=["-b", "--baud"], help="Baud rate")
+    ] = DEFAULT_BAUD,
+) -> None:
+    """Controlla il LED RGB on-board su TIM4 (colori statici, PWM o termometro visivo)."""
+    color_map = {
+        "red": "C:255,0,0\n",
+        "green": "C:0,255,0\n",
+        "blue": "C:0,0,255\n",
+        "yellow": "C:255,200,0\n",
+        "cyan": "C:0,255,255\n",
+        "magenta": "C:255,0,255\n",
+        "white": "C:255,255,255\n",
+        "off": "C:0,0,0\n",
+        "temp": "C:TEMP\n",
+        "rainbow": "C:RAINBOW\n",
+    }
+
+    if color:
+        c_lower = color.lower()
+        if c_lower in color_map:
+            msg = color_map[c_lower]
+        else:
+            print(
+                f"[-] Colore non riconosciuto: {color}. Opzioni: {list(color_map.keys())}"
+            )
+            sys.exit(1)
+    elif r is not None or g is not None or b is not None:
+        r_val = max(0, min(255, r or 0))
+        g_val = max(0, min(255, g or 0))
+        b_val = max(0, min(255, b or 0))
+        msg = f"C:{r_val},{g_val},{b_val}\n"
+    else:
+        print("[!] Specificare --color <nome> oppure -r <0-255> -g <0-255> -b <0-255>.")
+        sys.exit(1)
+
+    print(f"[{get_timestamp()}] Invio comando RGB su {port}: {msg.strip()!r}...")
+    try:
+        with serial.Serial(port, baud, timeout=1.0) as ser:
+            ser.reset_input_buffer()
+            ser.write(msg.encode("ascii"))
+            ser.flush()
+            resp = ser.readline().decode("ascii", errors="replace").strip()
+            print(f"[+] Risposta STM32: {resp!r}")
+    except (serial.SerialException, OSError) as exc:
+        print(f"[-] Errore apertura porta seriale {port}: {exc}")
+        sys.exit(2)
+
+
 @app.command
 def listen(
     port: Annotated[
