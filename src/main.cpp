@@ -39,16 +39,48 @@ static bool last_key1_state = HIGH;
 // Current base RGB values before brightness scaling
 static uint8_t cur_r = 0, cur_g = 0, cur_b = 0;
 
-void apply_rgb_brightness() {
-    // Scale 0..255 by brightness percentage (0..100%)
-    uint8_t sr = (uint16_t)cur_r * current_brightness / 100;
-    uint8_t sg = (uint16_t)cur_g * current_brightness / 100;
-    uint8_t sb = (uint16_t)cur_b * current_brightness / 100;
+// CIE 1931 perceptual lightness table for 12-bit PWM (0..4095) across 0..100% brightness
+// Maps human logarithmic eye response to linear perceived luminous sensation
+static const uint16_t CIE_12BIT[101] = {
+       0,    5,    9,   14,   18,   23,   27,   32,   36,   41,
+      46,   52,   58,   64,   71,   78,   86,   94,  103,  112,
+     122,  133,  144,  156,  168,  181,  194,  209,  223,  239,
+     255,  272,  290,  309,  328,  348,  369,  391,  413,  436,
+     461,  486,  512,  539,  567,  595,  625,  656,  688,  720,
+     754,  789,  825,  862,  900,  939,  979, 1021, 1063, 1107,
+    1152, 1198, 1245, 1293, 1343, 1394, 1447, 1500, 1555, 1611,
+    1669, 1728, 1788, 1849, 1913, 1977, 2043, 2110, 2179, 2249,
+    2321, 2394, 2469, 2546, 2623, 2703, 2784, 2867, 2951, 3037,
+    3125, 3214, 3305, 3397, 3492, 3588, 3686, 3785, 3887, 3990,
+    4095
+};
 
-    // Active Low PWM on TIM4 channels: 255 = fully OFF, 0 = fully ON
-    analogWrite(PIN_RGB_RED, 255 - sr);
-    analogWrite(PIN_RGB_GREEN, 255 - sg);
-    analogWrite(PIN_RGB_BLUE, 255 - sb);
+static inline void write_channel_pwm(pin_size_t pin, uint16_t pwm_val) {
+    if (pwm_val == 0) {
+        // Active Low: 0% brightness -> pin driven solidly HIGH (completely OFF)
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, HIGH);
+    } else if (pwm_val >= 4095) {
+        // Active Low: 100% brightness -> pin driven solidly LOW (maximum ON)
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, LOW);
+    } else {
+        // Active Low 12-bit PWM: 4095 - val on TIM4
+        analogWrite(pin, 4095 - pwm_val);
+    }
+}
+
+void apply_rgb_brightness() {
+    uint8_t bri = constrain(current_brightness, 0, 100);
+    uint32_t scale = CIE_12BIT[bri]; // 0..4095
+
+    uint16_t pwm_r = (uint32_t)cur_r * scale / 255;
+    uint16_t pwm_g = (uint32_t)cur_g * scale / 255;
+    uint16_t pwm_b = (uint32_t)cur_b * scale / 255;
+
+    write_channel_pwm(PIN_RGB_RED, pwm_r);
+    write_channel_pwm(PIN_RGB_GREEN, pwm_g);
+    write_channel_pwm(PIN_RGB_BLUE, pwm_b);
 }
 
 void set_rgb_pwm(uint8_t r, uint8_t g, uint8_t b) {
@@ -144,7 +176,8 @@ void setup() {
     pinMode(PIN_KEY1, INPUT_PULLUP);
     pinMode(PIN_KEY2, INPUT_PULLUP);
 
-    // Configure RGB LED pins on TIM4
+    // Configure RGB LED pins on TIM4 with 12-bit PWM resolution (0..4095)
+    analogWriteResolution(12);
     pinMode(PIN_RGB_RED, OUTPUT);
     pinMode(PIN_RGB_GREEN, OUTPUT);
     pinMode(PIN_RGB_BLUE, OUTPUT);
@@ -306,9 +339,9 @@ void loop() {
         if (!key1_is_held && (now - key1_press_start >= 350)) {
             key1_is_held = true;
         }
-        if (key1_is_held && (now - last_brightness_ramp >= 25)) {
+        if (key1_is_held && (now - last_brightness_ramp >= 20)) {
             last_brightness_ramp = now;
-            int new_bright = (int)current_brightness + (brightness_dir * 2);
+            int new_bright = (int)current_brightness + brightness_dir;
             if (new_bright <= 5) {
                 new_bright = 5;
                 brightness_dir = 1; // Reverse: now ramp up
