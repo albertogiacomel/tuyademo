@@ -506,5 +506,44 @@ def backup_esp(
         sys.exit(res.returncode)
 
 
+@app.command(name="serve")
+def serve(
+    host: Annotated[
+        str, Parameter(name=["-H", "--host"], help="Indirizzo IP host di ascolto")
+    ] = "0.0.0.0",
+    port: Annotated[
+        int,
+        Parameter(
+            name=["-p", "--port"],
+            help="Porta HTTP per Web Dashboard e REST API",
+        ),
+    ] = 8080,
+    serial_port: Annotated[
+        str,
+        Parameter(name=["-s", "--serial-port"], help="Porta seriale STM32 COM"),
+    ] = DEFAULT_PORT,
+    baud: Annotated[
+        int, Parameter(name=["-b", "--baud"], help="Baud rate seriale")
+    ] = DEFAULT_BAUD,
+) -> None:
+    """Avvia il server Web Dashboard e REST API per controllo da smartphone/PC su rete Wi-Fi."""
+    from tuya_web import BoardBridge, create_app
+
+    print("=" * 64)
+    print("  🌐 TUYA TYDE 3.0 — WEB DASHBOARD & REST API SERVER")
+    print("=" * 64)
+    print(f"  • Seriale target    : {serial_port} @ {baud} baud")
+    print(f"  • Dashboard Web     : http://localhost:{port}/")
+    print(
+        f"  • Accesso Wi-Fi/LAN : http://0.0.0.0:{port}/ (oppure IP locale del tuo PC)"
+    )
+    print(f"  • REST API Status   : http://localhost:{port}/api/status")
+    print("=" * 64 + "\n")
+
+    bridge = BoardBridge(port=serial_port, baud=baud)
+    server_app = create_app(bridge)
+    server_app.run(host=host, port=port, debug=False)
+
+
 if __name__ == "__main__":
     app()
