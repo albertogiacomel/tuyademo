@@ -12,12 +12,13 @@
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
-#include <ArduinoJson.h>
 
 const char* AP_SSID = "Tuya-TYDE3-AP";
 const char* AP_PASS = "tuya123456";
 
 ESP8266WebServer server(80);
+
+void handleApiWifiScan();
 
 // Cached telemetry state from STM32
 static float cached_temp = 25.0f;
@@ -212,6 +213,22 @@ setInterval(poll,2000);poll();
 </html>
 )rawliteral";
 
+void handleApiWifiScan() {
+    int n = WiFi.scanNetworks(false, true);
+    String json = "[";
+    for (int i = 0; i < n; i++) {
+        if (i > 0) json += ",";
+        int rssi = WiFi.RSSI(i);
+        int signal = constrain((rssi + 100) * 2, 5, 100);
+        json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",";
+        json += "\"rssi\":" + String(rssi) + ",";
+        json += "\"signal\":" + String(signal) + ",";
+        json += "\"secure\":" + String(WiFi.encryptionType(i) != ENC_TYPE_NONE ? "true" : "false") + "}";
+    }
+    json += "]";
+    server.send(200, "application/json", json);
+}
+
 void setup() {
     Serial.begin(115200);
     delay(100);
@@ -227,10 +244,33 @@ void setup() {
     server.on("/api/rgb", HTTP_POST, handleApiRgb);
     server.on("/api/brightness", HTTP_POST, handleApiBrightness);
     server.on("/api/mode", HTTP_POST, handleApiMode);
+    server.on("/api/wifi/scan", HTTP_GET, handleApiWifiScan);
 
     server.begin();
 }
 
 void loop() {
     server.handleClient();
+
+    // Check for commands from STM32 over Serial (USART3)
+    if (Serial.available()) {
+        String line = Serial.readStringUntil('\n');
+        line.trim();
+        if (line.equalsIgnoreCase("SCAN") || line.equalsIgnoreCase("W:SCAN")) {
+            int n = WiFi.scanNetworks(false, true);
+            for (int i = 0; i < n; i++) {
+                Serial.printf("SSID:%s,RSSI:%d\n", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+            }
+            Serial.println("SCAN_DONE");
+        } else if (line.startsWith("W:") || line.startsWith("w:")) {
+            // Format: W:<ssid>,<password>
+            int comma = line.indexOf(',');
+            if (comma > 2) {
+                String s = line.substring(2, comma);
+                String p = line.substring(comma + 1);
+                WiFi.begin(s.c_str(), p.c_str());
+                Serial.println("WIFI:CONNECTING");
+            }
+        }
+    }
 }

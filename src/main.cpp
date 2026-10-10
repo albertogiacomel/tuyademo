@@ -265,6 +265,16 @@ void loop() {
                 }
                 continue;
             }
+        } else if (c == 'W' || c == 'w') {
+            // Wi-Fi credentials command: W:<ssid>,<password>
+            String cmd = Serial.readStringUntil('\n');
+            cmd.trim();
+            if (cmd.startsWith("W:") || cmd.startsWith("w:")) {
+                Serial3.print(cmd);
+                Serial3.print("\r\n");
+                Serial.print("WIFI:CONFIG_SENT\r\n");
+                continue;
+            }
         } else if (c == 'B') {
             Serial.read();
             jump_to_bootloader();
