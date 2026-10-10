@@ -28,27 +28,50 @@ static uint16_t rainbow_hue = 0;
 static bool last_key2_state = HIGH;
 static float current_temp_c = 25.0f;
 
-void set_rgb_pwm(uint8_t r, uint8_t g, uint8_t b) {
+// --- Brightness Control State ---
+static uint8_t current_brightness = 20; // Default 20% (comfortable, not blinding)
+static int8_t brightness_dir = -1;      // -1 = dimming, +1 = brightening
+static uint32_t key1_press_start = 0;
+static bool key1_is_held = false;
+static uint32_t last_brightness_ramp = 0;
+static bool last_key1_state = HIGH;
+
+// Current base RGB values before brightness scaling
+static uint8_t cur_r = 0, cur_g = 0, cur_b = 0;
+
+void apply_rgb_brightness() {
+    // Scale 0..255 by brightness percentage (0..100%)
+    uint8_t sr = (uint16_t)cur_r * current_brightness / 100;
+    uint8_t sg = (uint16_t)cur_g * current_brightness / 100;
+    uint8_t sb = (uint16_t)cur_b * current_brightness / 100;
+
     // Active Low PWM on TIM4 channels: 255 = fully OFF, 0 = fully ON
-    analogWrite(PIN_RGB_RED, 255 - r);
-    analogWrite(PIN_RGB_GREEN, 255 - g);
-    analogWrite(PIN_RGB_BLUE, 255 - b);
+    analogWrite(PIN_RGB_RED, 255 - sr);
+    analogWrite(PIN_RGB_GREEN, 255 - sg);
+    analogWrite(PIN_RGB_BLUE, 255 - sb);
+}
+
+void set_rgb_pwm(uint8_t r, uint8_t g, uint8_t b) {
+    cur_r = r;
+    cur_g = g;
+    cur_b = b;
+    apply_rgb_brightness();
 }
 
 void update_temp_color(float temp_c) {
-    // Visual temperature mapping:
-    // < 30°C: Pure Blue (0, 0, 255)
-    // 30 - 34°C: Cyan (0, 255, 255)
-    // 34 - 38°C: Green (0, 255, 0)
-    // 38 - 42°C: Yellow (255, 255, 0)
-    // > 42°C: Red (255, 0, 0)
-    if (temp_c < 30.0f) {
+    // Visual temperature mapping (realistic operational thermal thresholds):
+    // < 32°C: Pure Blue (0, 0, 255)
+    // 32 - 36°C: Cyan (0, 255, 255)
+    // 36 - 42°C: Green (0, 255, 0) - Normal operational MCU range (~34-37°C)
+    // 42 - 50°C: Yellow/Amber (255, 180, 0)
+    // > 50°C: Warning Red (255, 0, 0)
+    if (temp_c < 32.0f) {
         set_rgb_pwm(0, 50, 255); // Cool Blue
-    } else if (temp_c < 34.0f) {
-        set_rgb_pwm(0, 200, 200); // Cyan
-    } else if (temp_c < 38.0f) {
-        set_rgb_pwm(0, 255, 50); // Vibrant Green (Normal operational range ~34-36°C)
+    } else if (temp_c < 36.0f) {
+        set_rgb_pwm(0, 255, 200); // Cyan
     } else if (temp_c < 42.0f) {
+        set_rgb_pwm(0, 255, 30); // Vibrant Green (Normal operational range)
+    } else if (temp_c < 50.0f) {
         set_rgb_pwm(255, 180, 0); // Warm Yellow/Amber
     } else {
         set_rgb_pwm(255, 0, 0); // Warning Red
@@ -184,6 +207,14 @@ void loop() {
                     current_rgb_mode = RGB_MODE_OFF;
                     set_rgb_pwm(0, 0, 0);
                     Serial.print("RGB:OFF\r\n");
+                } else if (val.startsWith("BRIGHT:") || val.startsWith("B:")) {
+                    int b_idx = val.indexOf(':');
+                    int b_val = val.substring(b_idx + 1).toInt();
+                    current_brightness = constrain(b_val, 0, 100);
+                    apply_rgb_brightness();
+                    char b_buf[32];
+                    snprintf(b_buf, sizeof(b_buf), "RGB:BRIGHT:%d\r\n", current_brightness);
+                    Serial.print(b_buf);
                 } else {
                     // Parse r,g,b
                     int first_comma = val.indexOf(',');
@@ -263,6 +294,53 @@ void loop() {
     }
     last_key2_state = key2;
 
-    // --- 7. User Button 1 (PA11): Mirror on LED1 (PB6) ---
-    digitalWrite(PIN_LED1, digitalRead(PIN_KEY1));
+    // --- 7. User Button 1 (PA11): Hold to smoothly ramp brightness / Click to step ---
+    bool key1 = digitalRead(PIN_KEY1);
+    if (key1 == LOW && last_key1_state == HIGH) {
+        // Button 1 just pressed down
+        key1_press_start = now;
+        key1_is_held = false;
+        digitalWrite(PIN_LED1, LOW); // LED1 on as feedback
+    } else if (key1 == LOW && last_key1_state == LOW) {
+        // Button 1 is continuously being held
+        if (!key1_is_held && (now - key1_press_start >= 350)) {
+            key1_is_held = true;
+        }
+        if (key1_is_held && (now - last_brightness_ramp >= 25)) {
+            last_brightness_ramp = now;
+            int new_bright = (int)current_brightness + (brightness_dir * 2);
+            if (new_bright <= 5) {
+                new_bright = 5;
+                brightness_dir = 1; // Reverse: now ramp up
+            } else if (new_bright >= 100) {
+                new_bright = 100;
+                brightness_dir = -1; // Reverse: now ramp down
+            }
+            current_brightness = (uint8_t)new_bright;
+            apply_rgb_brightness();
+        }
+    } else if (key1 == HIGH && last_key1_state == LOW) {
+        // Button 1 released
+        if (!key1_is_held) {
+            // Short click: step through fixed comfortable levels
+            if (current_brightness <= 15) {
+                current_brightness = 25;
+            } else if (current_brightness <= 35) {
+                current_brightness = 50;
+            } else if (current_brightness <= 65) {
+                current_brightness = 75;
+            } else if (current_brightness <= 85) {
+                current_brightness = 100;
+            } else {
+                current_brightness = 10;
+            }
+            apply_rgb_brightness();
+        } else {
+            // After holding, reverse direction for the next hold
+            brightness_dir = -brightness_dir;
+        }
+        key1_is_held = false;
+        digitalWrite(PIN_LED1, HIGH); // LED1 off
+    }
+    last_key1_state = key1;
 }

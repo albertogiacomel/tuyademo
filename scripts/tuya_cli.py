@@ -168,6 +168,13 @@ def rgb(
     b: Annotated[
         int | None, Parameter(name=["-b"], help="Canale Blu PWM (0-255)")
     ] = None,
+    brightness: Annotated[
+        int | None,
+        Parameter(
+            name=["-l", "--brightness"],
+            help="Luminosità globale in percentuale (0-100%)",
+        ),
+    ] = None,
     port: Annotated[
         str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
     ] = DEFAULT_PORT,
@@ -175,7 +182,7 @@ def rgb(
         int, Parameter(name=["-b", "--baud"], help="Baud rate")
     ] = DEFAULT_BAUD,
 ) -> None:
-    """Controlla il LED RGB on-board su TIM4 (colori statici, PWM o termometro visivo)."""
+    """Controlla il LED RGB on-board su TIM4 (colori, PWM, luminosità o termometro visivo)."""
     color_map = {
         "red": "C:255,0,0\n",
         "green": "C:0,255,0\n",
@@ -189,10 +196,16 @@ def rgb(
         "rainbow": "C:RAINBOW\n",
     }
 
+    commands: list[str] = []
+
+    if brightness is not None:
+        b_val = max(0, min(100, brightness))
+        commands.append(f"C:B:{b_val}\n")
+
     if color:
         c_lower = color.lower()
         if c_lower in color_map:
-            msg = color_map[c_lower]
+            commands.append(color_map[c_lower])
         else:
             print(
                 f"[-] Colore non riconosciuto: {color}. Opzioni: {list(color_map.keys())}"
@@ -202,19 +215,23 @@ def rgb(
         r_val = max(0, min(255, r or 0))
         g_val = max(0, min(255, g or 0))
         b_val = max(0, min(255, b or 0))
-        msg = f"C:{r_val},{g_val},{b_val}\n"
-    else:
-        print("[!] Specificare --color <nome> oppure -r <0-255> -g <0-255> -b <0-255>.")
+        commands.append(f"C:{r_val},{g_val},{b_val}\n")
+
+    if not commands:
+        print("[!] Specificare --color <nome>, -r/-g/-b oppure --brightness <0-100>.")
         sys.exit(1)
 
-    print(f"[{get_timestamp()}] Invio comando RGB su {port}: {msg.strip()!r}...")
     try:
         with serial.Serial(port, baud, timeout=1.0) as ser:
             ser.reset_input_buffer()
-            ser.write(msg.encode("ascii"))
-            ser.flush()
-            resp = ser.readline().decode("ascii", errors="replace").strip()
-            print(f"[+] Risposta STM32: {resp!r}")
+            for msg in commands:
+                print(
+                    f"[{get_timestamp()}] Invio comando RGB su {port}: {msg.strip()!r}..."
+                )
+                ser.write(msg.encode("ascii"))
+                ser.flush()
+                resp = ser.readline().decode("ascii", errors="replace").strip()
+                print(f"[+] Risposta STM32: {resp!r}")
     except (serial.SerialException, OSError) as exc:
         print(f"[-] Errore apertura porta seriale {port}: {exc}")
         sys.exit(2)
@@ -321,8 +338,8 @@ def flash_bridge(
 def build_pio() -> None:
     """Compila il firmware C++ STM32 tramite PlatformIO Core e aggiorna firmware/."""
     print(f"[{get_timestamp()}] Compilazione firmware PlatformIO (stm32_bridge)...")
-    cmd = [sys.executable, "-m", "platformio", "run"]
-    res = subprocess.run(cmd, check=False)
+    cmd = [sys.executable, "-m", "platformio", "run", "-d", str(BASE_DIR)]
+    res = subprocess.run(cmd, cwd=BASE_DIR, check=False)
     if res.returncode != 0:
         print("[-] Compilazione fallita.")
         sys.exit(res.returncode)
@@ -370,8 +387,18 @@ def flash_pio(
     print(
         f"[{get_timestamp()}] Flashing PlatformIO C++ firmware su STM32 ({attempts}s finestra)..."
     )
+
+    # Tentativo software di salto in bootloader (comando 'B')
+    try:
+        with serial.Serial(port, DEFAULT_BAUD, timeout=0.1) as ser:
+            ser.write(b"B")
+            ser.flush()
+            time.sleep(0.1)
+    except (serial.SerialException, OSError):
+        pass  # MCU già in bootloader o spento: prosegue con tentativi standard
+
     print(
-        "  [👉 Tenere premuto S2: MCU BOOT e cliccare S1: MCU RST mentre stm32loader tenta la connessione]"
+        "  [👉 Se non si connette in automatico: tenere premuto S2: MCU BOOT e cliccare S1: MCU RST]"
     )
 
     t0 = time.time()
