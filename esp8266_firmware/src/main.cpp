@@ -148,6 +148,33 @@ void handleApiMode() {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid mode\"}");
 }
 
+void handleApiLed() {
+    if (server.hasArg("plain")) {
+        String body = server.arg("plain");
+        int lIdx = body.indexOf("\"led\":");
+        int mIdx = body.indexOf("\"mode\":");
+        int pIdx = body.indexOf("\"period_ms\":");
+        if (lIdx >= 0) {
+            int led = body.substring(lIdx + 6).toInt();
+            String mode = "BLINK";
+            int period = 500;
+            if (mIdx >= 0) {
+                int q1 = body.indexOf('"', mIdx + 7);
+                int q2 = body.indexOf('"', q1 + 1);
+                if (q1 > 0 && q2 > q1) mode = body.substring(q1 + 1, q2);
+            }
+            if (pIdx >= 0) {
+                period = body.substring(pIdx + 12).toInt();
+            }
+            mode.toUpperCase();
+            sendCommandToStm32("L:" + String(led) + "," + mode + "," + String(period));
+            server.send(200, "application/json", "{\"ok\":true}");
+            return;
+        }
+    }
+    server.send(400, "application/json", "{\"ok\":false}");
+}
+
 // Redirect root to dashboard (stored in PROGMEM)
 extern const char INDEX_HTML[] PROGMEM;
 void handleRoot() {
@@ -231,6 +258,14 @@ void handleApiWifiScan() {
 // Candidate GPIO pins on TYWE1S for LED3 (Active Low)
 static const uint8_t LED_PINS[] = {4, 5, 12, 13, 14};
 
+void handleApiWifiDisconnect() {
+    WiFi.disconnect();
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    Serial.println("WIFI:DISCONNECTED");
+    server.send(200, "application/json", "{\"ok\":true,\"message\":\"Disconnesso da LAN. Wi-Fi SoftAP Tuya-TYDE3-AP attivo per pairing con cellulare.\"}");
+}
+
 void setup() {
     Serial.begin(115200);
     delay(100);
@@ -253,6 +288,8 @@ void setup() {
     server.on("/api/brightness", HTTP_POST, handleApiBrightness);
     server.on("/api/mode", HTTP_POST, handleApiMode);
     server.on("/api/wifi/scan", HTTP_GET, handleApiWifiScan);
+    server.on("/api/wifi/disconnect", HTTP_POST, handleApiWifiDisconnect);
+    server.on("/api/led", HTTP_POST, handleApiLed);
 
     server.begin();
 }
@@ -285,7 +322,11 @@ void loop() {
             for (int i = 0; i < n; i++) {
                 Serial.printf("SSID:%s,RSSI:%d\n", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
             }
-            Serial.println("SCAN_DONE");
+        } else if (line.equalsIgnoreCase("W:DISCONNECT") || line.equalsIgnoreCase("W:RESET")) {
+            WiFi.disconnect();
+            WiFi.mode(WIFI_AP_STA);
+            WiFi.softAP(AP_SSID, AP_PASS);
+            Serial.println("WIFI:DISCONNECTED");
         } else if (line.startsWith("W:") || line.startsWith("w:")) {
             // Format: W:<ssid>,<password>
             int comma = line.indexOf(',');

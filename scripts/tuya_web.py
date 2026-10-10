@@ -10,14 +10,18 @@ Provides:
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import serial
 from flask import Flask, Response, jsonify, request
+
+CONFIG_FILE = Path(__file__).resolve().parent.parent / "config" / "wifi_config.json"
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -50,7 +54,35 @@ class BoardBridge:
             "last_seen": None,
             "wifi_connected": False,
             "wifi_ssid": "Vodafone-30456263",
+            "leds": {
+                "1": {
+                    "id": 1,
+                    "name": "LED 1 (PB6)",
+                    "mode": "BLINK",
+                    "period_ms": 500,
+                },
+                "2": {
+                    "id": 2,
+                    "name": "LED 2 (PB5 / Heartbeat)",
+                    "mode": "ON",
+                    "period_ms": 500,
+                },
+                "3": {
+                    "id": 3,
+                    "name": "LED 3 (TYWE1S Wi-Fi)",
+                    "mode": "BLINK",
+                    "period_ms": 500,
+                },
+            },
         }
+        if CONFIG_FILE.exists():
+            try:
+                cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                saved_ssid = cfg.get("ssid")
+                if saved_ssid:
+                    self.status["wifi_ssid"] = saved_ssid
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.debug("Config load error: %s", exc)
 
     def _get_serial(self) -> serial.Serial:
         if self._ser is None or not self._ser.is_open:
@@ -184,10 +216,58 @@ class BoardBridge:
                 return True
         return False
 
+    def set_led(self, led_id: int, mode: str, period_ms: int = 500) -> bool:
+        if led_id not in (1, 2, 3):
+            return False
+        m_str = mode.upper().strip()
+        if m_str not in ("ON", "OFF", "BLINK"):
+            return False
+        period = max(50, min(5000, int(period_ms)))
+        resp = self.send_cmd(f"L:{led_id},{m_str},{period}")
+        if "OK" in resp or "LED:" in resp:
+            s_id = str(led_id)
+            if s_id in self.status["leds"]:
+                self.status["leds"][s_id]["mode"] = m_str
+                self.status["leds"][s_id]["period_ms"] = period
+            if led_id == 3:
+                self.status["wifi_connected"] = m_str == "ON"
+            return True
+        return False
+
+    def query_leds(self) -> dict[str, Any]:
+        resp = self.send_cmd("L:?")
+        # Expected: LED:1=2,500;2=1,500;3=2,500
+        if resp.startswith("LED:"):
+            try:
+                parts = resp[4:].split(";")
+                mode_map = {0: "OFF", 1: "ON", 2: "BLINK"}
+                for p in parts:
+                    if "=" in p and "," in p:
+                        lid, vals = p.split("=", 1)
+                        m_int, per = vals.split(",", 1)
+                        if lid in self.status["leds"]:
+                            self.status["leds"][lid]["mode"] = mode_map.get(
+                                int(m_int), "OFF"
+                            )
+                            self.status["leds"][lid]["period_ms"] = int(per)
+            except (ValueError, IndexError) as exc:
+                logger.debug("Failed parsing LED query response: %s", exc)
+        return self.status["leds"]
+
+    def disconnect_wifi(self) -> bool:
+        resp = self.send_cmd("W:DISCONNECT")
+        self.status["wifi_connected"] = False
+        if "3" in self.status["leds"]:
+            self.status["leds"]["3"]["mode"] = "BLINK"
+            self.status["leds"]["3"]["period_ms"] = 500
+        return "OK" in resp or "DISCONNECTED" in resp
+
     def set_wifi_connected(self, connected: bool) -> bool:
         val = "1" if connected else "0"
         resp = self.send_cmd(f"C:WIFI:{val}")
         self.status["wifi_connected"] = connected
+        if "3" in self.status["leds"]:
+            self.status["leds"]["3"]["mode"] = "ON" if connected else "BLINK"
         return "OK" in resp or "WIFI:" in resp
 
     def set_wifi(self, ssid: str, password: str) -> bool:
@@ -195,6 +275,21 @@ class BoardBridge:
         if "CONFIG_SENT" in resp or "OK" in resp:
             self.status["wifi_ssid"] = ssid
             self.set_wifi_connected(True)
+            try:
+                CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+                CONFIG_FILE.write_text(
+                    json.dumps(
+                        {
+                            "ssid": ssid,
+                            "password": password,
+                            "saved_at": datetime.now(UTC).isoformat(),
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                logger.warning("Could not persist wifi config: %s", exc)
             return True
         return False
 
@@ -298,9 +393,50 @@ def create_app(bridge: BoardBridge) -> Flask:
 
     @app.route("/api/status", methods=["GET"])
     def api_status():
-        # Quick live temp update if possible
         bridge.read_temp()
+        bridge.query_leds()
         return jsonify(bridge.status)
+
+    @app.route("/api/leds", methods=["GET"])
+    def api_leds():
+        leds = bridge.query_leds()
+        return jsonify({"ok": True, "leds": leds})
+
+    @app.route("/api/led", methods=["POST"])
+    def api_led():
+        data = request.get_json(silent=True) or {}
+        led_id = int(data.get("led", 0))
+        mode = str(data.get("mode", "")).upper().strip()
+        period_ms = int(data.get("period_ms", 500))
+
+        if led_id not in (1, 2, 3):
+            return (
+                jsonify(
+                    {"ok": False, "error": "Parametro 'led' non valido (1, 2, o 3)"}
+                ),
+                400,
+            )
+        if mode not in ("ON", "OFF", "BLINK"):
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": "Parametro 'mode' non valido (ON, OFF, o BLINK)",
+                    }
+                ),
+                400,
+            )
+
+        ok = bridge.set_led(led_id, mode, period_ms)
+        return jsonify(
+            {
+                "ok": ok,
+                "led": led_id,
+                "mode": mode,
+                "period_ms": period_ms,
+                "leds": bridge.status["leds"],
+            }
+        )
 
     @app.route("/api/wifi/scan", methods=["GET"])
     def api_wifi_scan():
@@ -356,6 +492,21 @@ def create_app(bridge: BoardBridge) -> Flask:
                 "ssid": bridge.status.get("wifi_ssid"),
                 "led3": (
                     "SOLID_ON" if bridge.status["wifi_connected"] else "BLINK_0_5S"
+                ),
+            }
+        )
+
+    @app.route("/api/wifi/disconnect", methods=["POST"])
+    def api_wifi_disconnect():
+        ok = bridge.disconnect_wifi()
+        return jsonify(
+            {
+                "ok": ok,
+                "connected": False,
+                "led3": "BLINK_0_5S",
+                "message": (
+                    "Disconnesso dalla rete LAN. Wi-Fi SoftAP Tuya-TYDE3-AP"
+                    " attivo per pairing da cellulare. LED 3 lampeggia a 0.5s."
                 ),
             }
         )
@@ -477,6 +628,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       --green: #22c55e;
       --yellow: #eab308;
       --red: #ef4444;
+      --purple: #a855f7;
       --radius: 16px;
     }
 
@@ -511,7 +663,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 8px 4px;
+      padding: 6px 4px;
     }
 
     .logo-area {
@@ -521,20 +673,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     .logo-icon {
-      width: 36px;
-      height: 36px;
+      width: 38px;
+      height: 38px;
       background: linear-gradient(135deg, #38bdf8, #818cf8);
-      border-radius: 10px;
+      border-radius: 12px;
       display: flex;
       align-items: center;
       justify-content: center;
       font-size: 20px;
-      box-shadow: 0 4px 12px var(--accent-glow);
+      box-shadow: 0 4px 14px var(--accent-glow);
     }
 
     h1 {
       font-size: 1.25rem;
-      font-weight: 700;
+      font-weight: 800;
       letter-spacing: -0.02em;
     }
 
@@ -553,7 +705,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       border: 1px solid rgba(34, 197, 94, 0.3);
       color: var(--green);
       font-size: 0.75rem;
-      font-weight: 600;
+      font-weight: 700;
       transition: all 0.3s ease;
     }
 
@@ -571,7 +723,46 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       box-shadow: 0 0 8px currentColor;
     }
 
-    /* Cards */
+    /* Top Navigation Tabs */
+    .nav-tabs {
+      display: flex;
+      background: rgba(0, 0, 0, 0.35);
+      padding: 4px;
+      border-radius: 14px;
+      border: 1px solid var(--card-border);
+      gap: 6px;
+    }
+
+    .tab-btn {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 12px 16px;
+      border-radius: 10px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .tab-btn:hover {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .tab-btn.active {
+      background: linear-gradient(135deg, rgba(56, 189, 248, 0.25), rgba(37, 99, 235, 0.35));
+      border-color: var(--accent);
+      color: #fff;
+      box-shadow: 0 4px 16px rgba(56, 189, 248, 0.25);
+    }
+
+    /* Cards & Layout */
     .card {
       background: var(--card-bg);
       backdrop-filter: blur(16px);
@@ -587,13 +778,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     .card-title {
       font-size: 0.85rem;
-      font-weight: 600;
+      font-weight: 700;
       color: var(--text-muted);
       text-transform: uppercase;
       letter-spacing: 0.05em;
       display: flex;
       justify-content: space-between;
       align-items: center;
+    }
+
+    .tab-content {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
     }
 
     /* Telemetry Grid */
@@ -607,20 +804,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       background: rgba(0, 0, 0, 0.25);
       border: 1px solid rgba(255, 255, 255, 0.04);
       border-radius: 12px;
-      padding: 14px;
+      padding: 12px 14px;
       display: flex;
       flex-direction: column;
       gap: 4px;
     }
 
     .metric-val {
-      font-size: 1.7rem;
+      font-size: 1.5rem;
       font-weight: 800;
       letter-spacing: -0.02em;
     }
 
     .metric-sub {
-      font-size: 0.75rem;
+      font-size: 0.72rem;
       color: var(--text-muted);
     }
 
@@ -629,20 +826,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 16px 0;
+      padding: 12px 0;
     }
 
     .orb {
-      width: 100px;
-      height: 100px;
+      width: 96px;
+      height: 96px;
       border-radius: 50%;
       background: #38bdf8;
-      box-shadow: 0 0 40px rgba(56, 189, 248, 0.6);
+      box-shadow: 0 0 35px rgba(56, 189, 248, 0.6);
       transition: all 0.25s ease-out;
       border: 3px solid rgba(255, 255, 255, 0.4);
     }
 
-    /* Controls */
+    /* Sliders */
     .slider-group {
       display: flex;
       flex-direction: column;
@@ -668,8 +865,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     input[type="range"]::-webkit-slider-thumb {
       -webkit-appearance: none;
-      width: 26px;
-      height: 26px;
+      width: 24px;
+      height: 24px;
       border-radius: 50%;
       background: #ffffff;
       cursor: pointer;
@@ -679,10 +876,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     input[type="range"]::-webkit-slider-thumb:active {
-      transform: scale(1.15);
+      transform: scale(1.18);
     }
 
-    /* Preset Buttons */
+    /* Preset Grid */
     .preset-grid {
       display: grid;
       grid-template-columns: repeat(5, 1fr);
@@ -690,19 +887,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     .btn-preset {
-      height: 42px;
+      height: 40px;
       border-radius: 10px;
       border: 1px solid rgba(255, 255, 255, 0.15);
       cursor: pointer;
       transition: transform 0.15s, box-shadow 0.15s;
-      position: relative;
     }
 
     .btn-preset:active {
       transform: scale(0.92);
     }
 
-    /* Mode Selection */
+    /* Mode Grid */
     .mode-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -713,7 +909,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       background: rgba(255, 255, 255, 0.04);
       border: 1px solid var(--card-border);
       color: var(--text);
-      padding: 14px 10px;
+      padding: 13px 10px;
       border-radius: 12px;
       font-size: 0.85rem;
       font-weight: 600;
@@ -736,6 +932,144 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       box-shadow: 0 0 16px var(--accent-glow);
     }
 
+    /* Status LED Card Item */
+    .led-card {
+      background: rgba(0, 0, 0, 0.28);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      transition: border-color 0.2s;
+    }
+
+    .led-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .led-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.9rem;
+      font-weight: 700;
+    }
+
+    .led-indicator {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      display: inline-block;
+      transition: all 0.3s;
+    }
+
+    .led-indicator.on {
+      background: #22c55e;
+      box-shadow: 0 0 10px #22c55e;
+    }
+
+    .led-indicator.off {
+      background: #475569;
+      box-shadow: none;
+    }
+
+    .led-indicator.blink {
+      background: #eab308;
+      box-shadow: 0 0 10px #eab308;
+      animation: pulse 1s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.3; transform: scale(0.85); }
+    }
+
+    .led-badge {
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--card-border);
+    }
+
+    .led-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+    }
+
+    .btn-led-action {
+      padding: 9px 8px;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      cursor: pointer;
+      border: 1px solid var(--card-border);
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--text);
+      transition: all 0.15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+    }
+
+    .btn-led-action:hover {
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    .btn-led-action:active {
+      transform: scale(0.96);
+    }
+
+    .btn-led-action.active-on {
+      background: rgba(34, 197, 94, 0.2);
+      border-color: var(--green);
+      color: var(--green);
+    }
+
+    .btn-led-action.active-off {
+      background: rgba(239, 68, 68, 0.2);
+      border-color: var(--red);
+      color: var(--red);
+    }
+
+    .btn-led-action.active-blink {
+      background: rgba(234, 179, 8, 0.2);
+      border-color: var(--yellow);
+      color: var(--yellow);
+    }
+
+    .freq-chips {
+      display: flex;
+      gap: 6px;
+      margin-top: 4px;
+    }
+
+    .chip-freq {
+      flex: 1;
+      padding: 5px;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--card-border);
+      color: var(--text-muted);
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.15s;
+    }
+
+    .chip-freq:hover {
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+
     /* Color Picker Row */
     .picker-row {
       display: flex;
@@ -746,8 +1080,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     input[type="color"] {
       -webkit-appearance: none;
       border: none;
-      width: 48px;
-      height: 48px;
+      width: 44px;
+      height: 44px;
       border-radius: 12px;
       cursor: pointer;
       background: transparent;
@@ -762,14 +1096,51 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       border-radius: 12px;
     }
 
-    /* API Explorer */
+    /* Wi-Fi & Settings Elements */
+    .input-field {
+      width: 100%;
+      padding: 12px 14px;
+      background: rgba(0,0,0,0.35);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      color: var(--text);
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .input-field:focus {
+      border-color: var(--accent);
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #0284c7, #2563eb);
+      border: none;
+      color: white;
+      padding: 14px;
+      border-radius: 12px;
+      font-weight: 700;
+      font-size: 0.9rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      box-shadow: 0 4px 16px rgba(37, 99, 235, 0.35);
+      transition: transform 0.15s, opacity 0.15s;
+    }
+
+    .btn-primary:active {
+      transform: scale(0.98);
+    }
+
     .code-box {
       background: #050810;
       border: 1px solid rgba(255, 255, 255, 0.08);
       border-radius: 8px;
       padding: 12px;
       font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-      font-size: 0.75rem;
+      font-size: 0.73rem;
       color: #93c5fd;
       overflow-x: auto;
       white-space: pre-wrap;
@@ -777,7 +1148,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     footer {
       text-align: center;
-      font-size: 0.7rem;
+      font-size: 0.72rem;
       color: var(--text-muted);
       padding: 12px 0;
     }
@@ -800,182 +1171,328 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </header>
 
-    <!-- Telemetry Card -->
-    <div class="card">
-      <div class="card-title">
-        <span>🌡️ Telemetria MCU STM32</span>
-        <span id="latencyText" style="font-size: 0.75rem; text-transform: none; color: var(--text-muted);">-- ms</span>
+    <!-- Top Navigation Menu / Tabs -->
+    <nav class="nav-tabs">
+      <button id="tabBtnLed" class="tab-btn active" onclick="switchTab('led')">
+        <span style="font-size: 1.1rem;">💡</span>
+        <span>Controllo LED</span>
+      </button>
+      <button id="tabBtnSettings" class="tab-btn" onclick="switchTab('settings')">
+        <span style="font-size: 1.1rem;">⚙️</span>
+        <span>Impostazioni & Wi-Fi</span>
+      </button>
+    </nav>
+
+    <!-- ==================== TAB 1: CONTROLLO LED ==================== -->
+    <div id="tabLed" class="tab-content">
+      
+      <!-- Telemetry Quick Row -->
+      <div class="card" style="padding: 14px 18px;">
+        <div class="card-title">
+          <span>🌡️ Telemetria Hardware</span>
+          <span id="latencyText" style="font-size: 0.75rem; text-transform: none; color: var(--text-muted);">-- ms</span>
+        </div>
+        <div class="telemetry-grid">
+          <div class="metric-box">
+            <span class="metric-sub">Temperatura MCU Core</span>
+            <span id="tempVal" class="metric-val" style="color: #22c55e;">--.- °C</span>
+            <span id="tempStatus" class="metric-sub">Ottimale</span>
+          </div>
+          <div class="metric-box">
+            <span class="metric-sub">Tensione VDD Reale</span>
+            <span id="vddVal" class="metric-val">3.29 V</span>
+            <span class="metric-sub">Calibrata VREFINT</span>
+          </div>
+        </div>
       </div>
-      <div class="telemetry-grid">
-        <div class="metric-box">
-          <span class="metric-sub">Temperatura Core (ADC16)</span>
-          <span id="tempVal" class="metric-val" style="color: #22c55e;">--.- °C</span>
-          <span id="tempStatus" class="metric-sub">Ottimale</span>
+
+      <!-- Live RGB Orb & Color Controls -->
+      <div class="card">
+        <div class="card-title">
+          <span>🌈 Controllo LED RGB On-Board (TIM4)</span>
+          <span id="rgbLabel" style="font-size: 0.75rem; text-transform: none;">RGB: (0, 255, 30)</span>
         </div>
-        <div class="metric-box">
-          <span class="metric-sub">Tensione VDD Reale</span>
-          <span id="vddVal" class="metric-val">3.29 V</span>
-          <span class="metric-sub">Calibrata VREFINT</span>
+
+        <div class="orb-container">
+          <div id="lightOrb" class="orb"></div>
         </div>
+
+        <!-- Brightness Slider -->
+        <div class="slider-group">
+          <div class="slider-header">
+            <span>Luminosità RGB</span>
+            <span id="brightVal">20%</span>
+          </div>
+          <input type="range" id="brightSlider" min="5" max="100" value="20">
+        </div>
+
+        <!-- Quick Preset Colors -->
+        <div class="slider-header" style="margin-top: 4px;">
+          <span>Colori Rapidi</span>
+        </div>
+        <div class="preset-grid">
+          <button class="btn-preset" style="background: #ef4444;" onclick="applyColor('red')" title="Rosso"></button>
+          <button class="btn-preset" style="background: #22c55e;" onclick="applyColor('green')" title="Verde"></button>
+          <button class="btn-preset" style="background: #3b82f6;" onclick="applyColor('blue')" title="Blu"></button>
+          <button class="btn-preset" style="background: #eab308;" onclick="applyColor('yellow')" title="Giallo"></button>
+          <button class="btn-preset" style="background: #06b6d4;" onclick="applyColor('cyan')" title="Ciano"></button>
+          <button class="btn-preset" style="background: #ec4899;" onclick="applyColor('magenta')" title="Magenta"></button>
+          <button class="btn-preset" style="background: #ffffff;" onclick="applyColor('white')" title="Bianco Freddo"></button>
+          <button class="btn-preset" style="background: #fde047;" onclick="applyColor('warm')" title="Bianco Caldo"></button>
+          <button class="btn-preset" style="background: #a855f7;" onclick="setCustomRgb(168, 85, 247)" title="Viola"></button>
+          <button class="btn-preset" style="background: #111827; border-color: #374151;" onclick="applyMode('OFF')" title="Spento">⬛</button>
+        </div>
+
+        <!-- Custom Color Picker Row -->
+        <div class="picker-row" style="margin-top: 4px;">
+          <input type="color" id="nativeColorPicker" value="#00ff1e">
+          <div style="flex: 1;">
+            <div style="font-size: 0.85rem; font-weight: 600;">Selettore Colore Personalizzato</div>
+            <div style="font-size: 0.75rem; color: var(--text-muted);">Scegli qualsiasi colore esadecimale con PWM 12-bit</div>
+          </div>
+        </div>
+
+        <!-- Operating Modes Selection -->
+        <div class="slider-header" style="margin-top: 4px;">
+          <span>Modalità RGB</span>
+        </div>
+        <div class="mode-grid">
+          <button id="btnModeTemp" class="btn-mode active" onclick="applyMode('TEMP')">
+            🌡️ Termometro Core
+          </button>
+          <button id="btnModeRainbow" class="btn-mode" onclick="applyMode('RAINBOW')">
+            🌈 Arcobaleno Fade
+          </button>
+          <button id="btnModeManual" class="btn-mode" onclick="applyMode('MANUAL')">
+            🎨 Colore Manuale
+          </button>
+          <button id="btnModeOff" class="btn-mode" onclick="applyMode('OFF')">
+            ⬛ Spegni LED
+          </button>
+        </div>
+      </div>
+
+      <!-- Dedicated 3 Status LEDs Section -->
+      <div class="card">
+        <div class="card-title">
+          <span>💡 3 LED di Stato On-Board</span>
+          <span style="font-size: 0.75rem; text-transform: none; color: var(--text-muted);">Controllo Indipendente</span>
+        </div>
+        <div style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4;">
+          Accendi, spegni o imposta la frequenza di lampeggio per ciascuno dei tre LED di stato fisici della scheda Tuya TYDE 3.0.
+        </div>
+
+        <!-- LED 1: PB6 -->
+        <div class="led-card">
+          <div class="led-header">
+            <div class="led-title">
+              <span id="led1Dot" class="led-indicator blink"></span>
+              <span>LED 1 <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">(Pin PB6 • Active Low)</span></span>
+            </div>
+            <span id="led1Badge" class="led-badge" style="color: var(--yellow);">BLINK (0.5s)</span>
+          </div>
+          <div class="led-actions">
+            <button id="btnLed1On" class="btn-led-action" onclick="setLed(1, 'ON')">🟢 Accendi</button>
+            <button id="btnLed1Off" class="btn-led-action" onclick="setLed(1, 'OFF')">⚫ Spegni</button>
+            <button id="btnLed1Blink" class="btn-led-action active-blink" onclick="setLed(1, 'BLINK')">⚡ Blink</button>
+          </div>
+          <div class="slider-group">
+            <div class="slider-header">
+              <span>Frequenza Lampeggio</span>
+              <span id="led1PeriodVal" style="color: var(--accent);">500 ms (2.0 Hz)</span>
+            </div>
+            <input type="range" id="led1Slider" min="100" max="2000" step="50" value="500" oninput="onLedSliderInput(1, this.value)" onchange="onLedSliderChange(1, this.value)">
+            <div class="freq-chips">
+              <span class="chip-freq" onclick="setLedFreq(1, 200)">0.2s (5 Hz)</span>
+              <span class="chip-freq" onclick="setLedFreq(1, 500)">0.5s (2 Hz)</span>
+              <span class="chip-freq" onclick="setLedFreq(1, 1000)">1.0s (1 Hz)</span>
+              <span class="chip-freq" onclick="setLedFreq(1, 2000)">2.0s (0.5 Hz)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- LED 2: PB5 -->
+        <div class="led-card">
+          <div class="led-header">
+            <div class="led-title">
+              <span id="led2Dot" class="led-indicator on"></span>
+              <span>LED 2 <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">(Pin PB5 • Heartbeat MCU)</span></span>
+            </div>
+            <span id="led2Badge" class="led-badge" style="color: var(--green);">ACCESO FISSO</span>
+          </div>
+          <div class="led-actions">
+            <button id="btnLed2On" class="btn-led-action active-on" onclick="setLed(2, 'ON')">🟢 Accendi</button>
+            <button id="btnLed2Off" class="btn-led-action" onclick="setLed(2, 'OFF')">⚫ Spegni</button>
+            <button id="btnLed2Blink" class="btn-led-action" onclick="setLed(2, 'BLINK')">⚡ Blink</button>
+          </div>
+          <div class="slider-group">
+            <div class="slider-header">
+              <span>Frequenza Lampeggio</span>
+              <span id="led2PeriodVal" style="color: var(--accent);">500 ms (2.0 Hz)</span>
+            </div>
+            <input type="range" id="led2Slider" min="100" max="2000" step="50" value="500" oninput="onLedSliderInput(2, this.value)" onchange="onLedSliderChange(2, this.value)">
+            <div class="freq-chips">
+              <span class="chip-freq" onclick="setLedFreq(2, 200)">0.2s (5 Hz)</span>
+              <span class="chip-freq" onclick="setLedFreq(2, 500)">0.5s (2 Hz)</span>
+              <span class="chip-freq" onclick="setLedFreq(2, 1000)">1.0s (1 Hz)</span>
+              <span class="chip-freq" onclick="setLedFreq(2, 2000)">2.0s (0.5 Hz)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- LED 3: TYWE1S / PB4 / PC13 -->
+        <div class="led-card">
+          <div class="led-header">
+            <div class="led-title">
+              <span id="led3Dot" class="led-indicator blink"></span>
+              <span>LED 3 <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">(TYWE1S Wi-Fi • PB4/PC13)</span></span>
+            </div>
+            <span id="led3Badge" class="led-badge" style="color: var(--yellow);">BLINK 0.5s (In attesa)</span>
+          </div>
+          <div style="font-size: 0.73rem; color: var(--text-muted); background: rgba(0,0,0,0.2); padding: 6px 10px; border-radius: 6px;">
+            ℹ️ <b>Regola Wi-Fi:</b> Fisso se connesso al Wi-Fi, lampeggia a 0.5s se disconnesso. Puoi sovrascriverlo manualmente qui sotto.
+          </div>
+          <div class="led-actions">
+            <button id="btnLed3On" class="btn-led-action" onclick="setLed(3, 'ON')">🟢 Accendi</button>
+            <button id="btnLed3Off" class="btn-led-action" onclick="setLed(3, 'OFF')">⚫ Spegni</button>
+            <button id="btnLed3Blink" class="btn-led-action active-blink" onclick="setLed(3, 'BLINK')">⚡ Blink</button>
+          </div>
+          <div class="slider-group">
+            <div class="slider-header">
+              <span>Frequenza Lampeggio</span>
+              <span id="led3PeriodVal" style="color: var(--accent);">500 ms (2.0 Hz)</span>
+            </div>
+            <input type="range" id="led3Slider" min="100" max="2000" step="50" value="500" oninput="onLedSliderInput(3, this.value)" onchange="onLedSliderChange(3, this.value)">
+            <div class="freq-chips">
+              <span class="chip-freq" onclick="setLedFreq(3, 200)">0.2s (5 Hz)</span>
+              <span class="chip-freq" onclick="setLedFreq(3, 500)">0.5s (2 Hz)</span>
+              <span class="chip-freq" onclick="setLedFreq(3, 1000)">1.0s (1 Hz)</span>
+              <span class="chip-freq" onclick="setLedFreq(3, 2000)">2.0s (0.5 Hz)</span>
+            </div>
+          </div>
+        </div>
+
       </div>
     </div>
 
-    <!-- Live RGB Orb & Color Controls -->
-    <div class="card">
-      <div class="card-title">
-        <span>🌈 Controllo LED RGB On-Board (TIM4)</span>
-        <span id="rgbLabel" style="font-size: 0.75rem; text-transform: none;">RGB: (0, 255, 30)</span>
-      </div>
-
-      <div class="orb-container">
-        <div id="lightOrb" class="orb"></div>
-      </div>
-
-      <!-- Brightness Slider -->
-      <div class="slider-group">
-        <div class="slider-header">
-          <span>Luminosità</span>
-          <span id="brightVal">20%</span>
+    <!-- ==================== TAB 2: IMPOSTAZIONI & WI-FI ==================== -->
+    <div id="tabSettings" class="tab-content" style="display: none;">
+      
+      <!-- Wi-Fi Configuration Card -->
+      <div class="card">
+        <div class="card-title">
+          <span>📡 Configurazione Rete Wi-Fi (TYWE1S)</span>
+          <span id="wifiBadge" style="font-size: 0.75rem; text-transform: none; color: var(--text-muted);">Non configurato</span>
         </div>
-        <input type="range" id="brightSlider" min="5" max="100" value="20">
-      </div>
-
-      <!-- Quick Preset Colors -->
-      <div class="slider-header" style="margin-top: 4px;">
-        <span>Colori Rapidi</span>
-      </div>
-      <div class="preset-grid">
-        <button class="btn-preset" style="background: #ef4444;" onclick="applyColor('red')" title="Rosso"></button>
-        <button class="btn-preset" style="background: #22c55e;" onclick="applyColor('green')" title="Verde"></button>
-        <button class="btn-preset" style="background: #3b82f6;" onclick="applyColor('blue')" title="Blu"></button>
-        <button class="btn-preset" style="background: #eab308;" onclick="applyColor('yellow')" title="Giallo"></button>
-        <button class="btn-preset" style="background: #06b6d4;" onclick="applyColor('cyan')" title="Ciano"></button>
-        <button class="btn-preset" style="background: #ec4899;" onclick="applyColor('magenta')" title="Magenta"></button>
-        <button class="btn-preset" style="background: #ffffff;" onclick="applyColor('white')" title="Bianco Freddo"></button>
-        <button class="btn-preset" style="background: #fde047;" onclick="applyColor('warm')" title="Bianco Caldo"></button>
-        <button class="btn-preset" style="background: #a855f7;" onclick="setCustomRgb(168, 85, 247)" title="Viola"></button>
-        <button class="btn-preset" style="background: #111827; border-color: #374151;" onclick="applyMode('OFF')" title="Spento">⬛</button>
-      </div>
-
-      <!-- Custom Color Picker Row -->
-      <div class="picker-row" style="margin-top: 4px;">
-        <input type="color" id="nativeColorPicker" value="#00ff1e">
-        <div style="flex: 1;">
-          <div style="font-size: 0.85rem; font-weight: 600;">Selettore Colore Personalizzato</div>
-          <div style="font-size: 0.75rem; color: var(--text-muted);">Tocca per scegliere qualsiasi tonalità esadecimale</div>
+        <div style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4;">
+          Scansiona le reti 2.4 GHz visibili al modulo <b>TYWE1S (ESP8266)</b>, seleziona il tuo SSID dall'elenco e invia password e credenziali alla scheda per il salvataggio permanente in memoria Flash.
         </div>
-      </div>
-    </div>
 
-    <!-- Operating Modes Card -->
-    <div class="card">
-      <div class="card-title">Modalità Operativa</div>
-      <div class="mode-grid">
-        <button id="btnModeTemp" class="btn-mode active" onclick="applyMode('TEMP')">
-          🌡️ Termometro Core
+        <!-- Scan Button -->
+        <button id="btnScanWifi" onclick="scanWifiNetworks()" style="background: rgba(56, 189, 248, 0.12); border: 1px solid var(--accent); color: var(--accent); padding: 12px 14px; border-radius: 10px; font-size: 0.85rem; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; transition: all 0.2s;">
+          🔍 Cerca Reti Wi-Fi Visibili al Tuya
         </button>
-        <button id="btnModeRainbow" class="btn-mode" onclick="applyMode('RAINBOW')">
-          🌈 Arcobaleno Fade
-        </button>
-        <button id="btnModeManual" class="btn-mode" onclick="applyMode('MANUAL')">
-          🎨 Colore Manuale
-        </button>
-        <button id="btnModeOff" class="btn-mode" onclick="applyMode('OFF')">
-          ⬛ Spegni LED
-        </button>
-      </div>
-    </div>
 
-    <!-- Wi-Fi Configuration Card -->
-    <div class="card">
-      <div class="card-title">
-        <span>📡 Configurazione Rete Wi-Fi (TYWE1S)</span>
-        <span id="wifiBadge" style="font-size: 0.75rem; text-transform: none; color: var(--text-muted);">Non configurato</span>
-      </div>
-      <div style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4;">
-        Cerca le reti Wi-Fi 2.4 GHz visibili al modulo <b>TYWE1S (ESP8266)</b>, seleziona il tuo SSID dall'elenco e invia la password alla scheda.
-      </div>
-
-      <!-- Scan Networks Button & Selector -->
-      <div style="display: flex; gap: 8px; align-items: center; margin-top: 4px;">
-        <button id="btnScanWifi" onclick="scanWifiNetworks()" style="flex: 1; background: rgba(56, 189, 248, 0.12); border: 1px solid var(--accent); color: var(--accent); padding: 11px 14px; border-radius: 10px; font-size: 0.85rem; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; transition: all 0.2s;">
-          🔍 Cerca Reti Visibili al Tuya
-        </button>
-      </div>
-
-      <!-- Discovered Networks Container -->
-      <div id="networkListContainer" style="display: none; flex-direction: column; gap: 6px;">
-        <label style="font-size: 0.75rem; font-weight: 600; color: var(--text-muted); display: flex; justify-content: space-between;">
-          <span>Reti Trovate (Tocca per Selezionare)</span>
-          <span id="scanCount" style="color: var(--accent);">-- reti</span>
-        </label>
-        <div id="networkList" style="max-height: 160px; overflow-y: auto; background: rgba(0,0,0,0.3); border: 1px solid var(--card-border); border-radius: 10px; padding: 6px; display: flex; flex-direction: column; gap: 4px;">
+        <!-- Discovered Networks Container -->
+        <div id="networkListContainer" style="display: none; flex-direction: column; gap: 6px;">
+          <label style="font-size: 0.75rem; font-weight: 700; color: var(--text-muted); display: flex; justify-content: space-between;">
+            <span>Reti Rilevate (Tocca per Selezionare)</span>
+            <span id="scanCount" style="color: var(--accent);">-- reti</span>
+          </label>
+          <div id="networkList" style="max-height: 180px; overflow-y: auto; background: rgba(0,0,0,0.3); border: 1px solid var(--card-border); border-radius: 10px; padding: 6px; display: flex; flex-direction: column; gap: 4px;">
+          </div>
         </div>
-      </div>
 
-      <!-- Quick Select Chip for Vodafone-30456263 -->
-      <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 2px;">
-        <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600;">Rete Preferita:</span>
-        <button type="button" onclick="selectSsid('Vodafone-30456263')" style="background: rgba(56, 189, 248, 0.15); border: 1px solid var(--accent); color: var(--accent); padding: 5px 12px; border-radius: 8px; font-size: 0.8rem; font-weight: 700; cursor: pointer; display: flex; align-items: center; gap: 6px; transition: all 0.2s;">
-          📶 Vodafone-30456263
-        </button>
-      </div>
+        <!-- Quick Select Chip for Vodafone-30456263 -->
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+          <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600;">Rete Preferita:</span>
+          <button type="button" onclick="selectSsid('Vodafone-30456263')" style="background: rgba(56, 189, 248, 0.15); border: 1px solid var(--accent); color: var(--accent); padding: 6px 12px; border-radius: 8px; font-size: 0.8rem; font-weight: 700; cursor: pointer; display: flex; align-items: center; gap: 6px; transition: all 0.2s;">
+            📶 Vodafone-30456263
+          </button>
+        </div>
 
-      <!-- LED 3 Wi-Fi Status & Hardware Sync Indicator -->
-      <div style="background: rgba(0,0,0,0.3); border: 1px solid var(--card-border); border-radius: 12px; padding: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <span id="led3Dot" style="width: 12px; height: 12px; border-radius: 50%; background: #eab308; box-shadow: 0 0 10px #eab308; display: inline-block;"></span>
+        <!-- Manual Wi-Fi State Override -->
+        <div style="background: rgba(0,0,0,0.25); border: 1px solid var(--card-border); border-radius: 12px; padding: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
           <div>
-            <div style="font-size: 0.8rem; font-weight: 700;">Indicatore LED 3 (Wi-Fi)</div>
-            <div id="led3Text" style="font-size: 0.75rem; color: #eab308; font-weight: 600;">Lampeggio 0.5s (In attesa)</div>
+            <div style="font-size: 0.8rem; font-weight: 700;">Stato Connessione Wi-Fi Scheda</div>
+            <div style="font-size: 0.73rem; color: var(--text-muted);">Sincronizza stato e LED 3</div>
+          </div>
+          <div style="display: flex; gap: 6px;">
+            <button type="button" onclick="setWifiConnectionStatus(true)" style="padding: 6px 12px; background: rgba(34, 197, 94, 0.15); border: 1px solid var(--green); color: var(--green); border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer;">
+              🟢 Connesso (Fisso)
+            </button>
+            <button type="button" onclick="setWifiConnectionStatus(false)" style="padding: 6px 12px; background: rgba(239, 68, 68, 0.15); border: 1px solid var(--red); color: var(--red); border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer;">
+              🟠 Disconnesso (Blink)
+            </button>
           </div>
         </div>
-        <div style="display: flex; gap: 6px;">
-          <button type="button" onclick="setWifiConnectionStatus(true)" style="padding: 6px 12px; background: rgba(34, 197, 94, 0.15); border: 1px solid var(--green); color: var(--green); border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer;">
-            🟢 Fisso
+
+        <!-- Inputs Form -->
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div>
+            <label style="font-size: 0.75rem; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 6px;">SSID Rete (Nome Wi-Fi)</label>
+            <input type="text" id="wifiSsid" class="input-field" placeholder="Es. Vodafone-30456263 o seleziona sopra" autocomplete="username">
+          </div>
+          <div>
+            <label style="font-size: 0.75rem; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 6px;">Password Wi-Fi</label>
+            <div style="position: relative;">
+              <input type="password" id="wifiPass" class="input-field" placeholder="Password WPA2/WPA3" autocomplete="current-password" style="padding-right: 42px;">
+              <button type="button" onclick="togglePassVisibility()" style="position: absolute; right: 12px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 1.1rem; line-height: 1;">👁️</button>
+            </div>
+          </div>
+          <button id="btnSendWifi" class="btn-primary" onclick="sendWifiConfig()">
+            🚀 Invia Configurazione al Tuya (Push Wi-Fi & Salva)
           </button>
-          <button type="button" onclick="setWifiConnectionStatus(false)" style="padding: 6px 12px; background: rgba(239, 68, 68, 0.15); border: 1px solid var(--red); color: var(--red); border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer;">
-            🟠 Blink 0.5s
-          </button>
+          <div id="wifiMsg" style="font-size: 0.8rem; display: none; padding: 12px; border-radius: 10px; text-align: center; font-weight: 600;"></div>
         </div>
       </div>
 
-      <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 4px;">
-        <div>
-          <label style="font-size: 0.75rem; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 6px;">SSID Rete (Nome Wi-Fi)</label>
-          <input type="text" id="wifiSsid" placeholder="Es. Seleziona sopra o digita qui" autocomplete="username" style="width: 100%; padding: 12px 14px; background: rgba(0,0,0,0.35); border: 1px solid var(--card-border); border-radius: 10px; color: var(--text); font-size: 0.9rem; outline: none;">
+      <!-- Disconnect / Reset LAN Wi-Fi Card -->
+      <div class="card" style="border: 1px solid rgba(239, 68, 68, 0.3); background: rgba(239, 68, 68, 0.05);">
+        <div class="card-title" style="color: var(--red);">
+          <span>🔌 Disconnetti Wi-Fi dalla Rete LAN</span>
+          <span style="font-size: 0.72rem; color: var(--yellow); text-transform: none; font-weight: 700;">SoftAP Pairing</span>
         </div>
-        <div>
-          <label style="font-size: 0.75rem; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 6px;">Password Wi-Fi</label>
-          <div style="position: relative;">
-            <input type="password" id="wifiPass" placeholder="Password WPA2/WPA3" autocomplete="current-password" style="width: 100%; padding: 12px 42px 12px 14px; background: rgba(0,0,0,0.35); border: 1px solid var(--card-border); border-radius: 10px; color: var(--text); font-size: 0.9rem; outline: none;">
-            <button type="button" onclick="togglePassVisibility()" style="position: absolute; right: 12px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 1.1rem; line-height: 1;">👁️</button>
-          </div>
+        <div style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4;">
+          Premendo questo pulsante, la scheda Tuya si disconnette dalla rete Wi-Fi di casa (LAN). Il modulo <b>TYWE1S</b> riattiva immediatamente l'Access Point <b>Tuya-TYDE3-AP</b> e il captive portal (192.168.4.1), tornando visibile per il pairing da cellulare. LED 3 tornerà a lampeggiare con frequenza 0.5s.
         </div>
-        <button id="btnSendWifi" onclick="sendWifiConfig()" style="background: linear-gradient(135deg, #0284c7, #2563eb); border: none; color: white; padding: 14px; border-radius: 12px; font-weight: 700; font-size: 0.9rem; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 4px; box-shadow: 0 4px 16px rgba(37, 99, 235, 0.35); transition: transform 0.15s;">
-          🚀 Invia Configurazione al Tuya (Push Wi-Fi)
+        <button id="btnDisconnectWifi" onclick="disconnectWifiLan()" style="background: rgba(239, 68, 68, 0.18); border: 1px solid var(--red); color: var(--red); padding: 13px; border-radius: 12px; font-weight: 700; font-size: 0.85rem; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; transition: all 0.2s;">
+          📱 Disconnetti dalla LAN & Rendi Visibile per Cellulare
         </button>
-        <div id="wifiMsg" style="font-size: 0.8rem; display: none; padding: 12px; border-radius: 10px; text-align: center; font-weight: 600;"></div>
+        <div id="disconnectMsg" style="display: none; font-size: 0.8rem; padding: 10px; border-radius: 8px; text-align: center; font-weight: 600;"></div>
       </div>
-    </div>
 
-    <!-- REST API Endpoints Quick Reference -->
-    <div class="card">
-      <div class="card-title">📡 REST API Endpoints</div>
-      <div class="code-box"># Configura Wi-Fi SSID e Password su modulo Tuya:
-curl -X POST http://&lt;IP&gt;:8080/api/wifi -H "Content-Type: application/json" -d '{"ssid": "Casa-WiFi", "password": "mypassword"}'
+      <!-- Autonomous Captive Portal & Smartphone Experience Info -->
+      <div class="card">
+        <div class="card-title">📱 Esperienza Utente Punto-a-Punto da Smartphone</div>
+        <div style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.5; display: flex; flex-direction: column; gap: 8px;">
+          <div><b>1. Connessione Diretta:</b> Dal cellulare, connettiti alla rete Wi-Fi <b>Tuya-TYDE3-AP</b> (password: <code style="color: var(--accent);">tuya123456</code>).</div>
+          <div><b>2. Captive Portal Automatico:</b> Lo smartphone apre direttamente la pagina di benvenuto su <code style="color: var(--accent);">http://192.168.4.1/</code> senza digitare nulla.</div>
+          <div><b>3. Salvataggio in Flash:</b> Quando selezioni la rete di casa (es. <i>Vodafone-30456263</i>), le credenziali vengono salvate permanentemente nella memoria non-volatile EEPROM del TYWE1S.</div>
+          <div><b>4. Passaggio alla Rete LAN:</b> Il Tuya si connette al router di casa, LED 3 diventa fisso ed è accessibile via browser da qualsiasi dispositivo su <code style="color: var(--accent);">http://tuya.local/</code>.</div>
+        </div>
+      </div>
 
-# Regola luminosità (0-100%):
-curl -X POST http://&lt;IP&gt;:8080/api/brightness -H "Content-Type: application/json" -d '{"brightness": 15}'
+      <!-- REST API Endpoints Quick Reference -->
+      <div class="card">
+        <div class="card-title">📡 REST API Endpoints</div>
+        <div class="code-box"># Controllo LED di stato (id: 1, 2, 3 • mode: ON, OFF, BLINK • period_ms):
+curl -X POST http://&lt;IP&gt;:8080/api/led -H "Content-Type: application/json" -d '{"led": 1, "mode": "BLINK", "period_ms": 200}'
+curl -X POST http://&lt;IP&gt;:8080/api/led -H "Content-Type: application/json" -d '{"led": 3, "mode": "ON"}'
+
+# Lettura stato di tutti i LED:
+curl http://&lt;IP&gt;:8080/api/leds
 
 # Imposta colore RGB e luminosità:
-curl -X POST http://&lt;IP&gt;:8080/api/rgb -H "Content-Type: application/json" -d '{"r": 0, "g": 255, "b": 0, "brightness": 20}'
+curl -X POST http://&lt;IP&gt;:8080/api/rgb -H "Content-Type: application/json" -d '{"r": 0, "g": 255, "b": 30, "brightness": 20}'
 
-# Imposta modalità (TEMP, RAINBOW, MANUAL, OFF):
-curl -X POST http://&lt;IP&gt;:8080/api/mode -H "Content-Type: application/json" -d '{"mode": "RAINBOW"}'
+# Configura Wi-Fi SSID e Password su modulo Tuya:
+curl -X POST http://&lt;IP&gt;:8080/api/wifi -H "Content-Type: application/json" -d '{"ssid": "Vodafone-30456263", "password": "pass"}'
 
-# Lettura telemetria sensore temperatura:
+# Lettura telemetria sensore temperatura e tensione:
 curl http://&lt;IP&gt;:8080/api/temp</div>
+      </div>
+
     </div>
 
     <footer>
@@ -988,6 +1505,7 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
     let currentMode = 'TEMP';
     let currentR = 0, currentG = 255, currentB = 30;
     let sliderDebounce = null;
+    let ledSlidersDebounce = {};
 
     const orb = document.getElementById('lightOrb');
     const brightSlider = document.getElementById('brightSlider');
@@ -1000,6 +1518,26 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
     const statusText = document.getElementById('statusText');
     const rgbLabel = document.getElementById('rgbLabel');
     const colorPicker = document.getElementById('nativeColorPicker');
+
+    // Navigation Tab Switching
+    function switchTab(tab) {
+      const tabLed = document.getElementById('tabLed');
+      const tabSettings = document.getElementById('tabSettings');
+      const tabBtnLed = document.getElementById('tabBtnLed');
+      const tabBtnSettings = document.getElementById('tabBtnSettings');
+
+      if (tab === 'led') {
+        tabLed.style.display = 'flex';
+        tabSettings.style.display = 'none';
+        tabBtnLed.classList.add('active');
+        tabBtnSettings.classList.remove('active');
+      } else {
+        tabLed.style.display = 'none';
+        tabSettings.style.display = 'flex';
+        tabBtnLed.classList.remove('active');
+        tabBtnSettings.classList.add('active');
+      }
+    }
 
     function updateOrb(r, g, b, brightness) {
       const alpha = Math.max(0.1, brightness / 100);
@@ -1024,6 +1562,85 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
       }
     }
 
+    function updateLedCard(id, mode, period) {
+      const dot = document.getElementById(`led${id}Dot`);
+      const badge = document.getElementById(`led${id}Badge`);
+      const btnOn = document.getElementById(`btnLed${id}On`);
+      const btnOff = document.getElementById(`btnLed${id}Off`);
+      const btnBlink = document.getElementById(`btnLed${id}Blink`);
+      const slider = document.getElementById(`led${id}Slider`);
+      const periodVal = document.getElementById(`led${id}PeriodVal`);
+
+      if (!dot) return;
+
+      dot.classList.remove('on', 'off', 'blink');
+      btnOn.classList.remove('active-on');
+      btnOff.classList.remove('active-off');
+      btnBlink.classList.remove('active-blink');
+
+      const hz = (1000 / (period || 500)).toFixed(1);
+      if (periodVal) periodVal.innerText = `${period || 500} ms (${hz} Hz)`;
+      if (slider && !slider.matches(':active')) slider.value = period || 500;
+
+      if (mode === 'ON') {
+        dot.classList.add('on');
+        badge.innerText = 'ACCESO FISSO';
+        badge.style.color = 'var(--green)';
+        btnOn.classList.add('active-on');
+      } else if (mode === 'OFF') {
+        dot.classList.add('off');
+        badge.innerText = 'SPENTO';
+        badge.style.color = 'var(--text-muted)';
+        btnOff.classList.add('active-off');
+      } else {
+        dot.classList.add('blink');
+        badge.innerText = `BLINK (${((period || 500) / 1000).toFixed(1)}s)`;
+        badge.style.color = 'var(--yellow)';
+        btnBlink.classList.add('active-blink');
+      }
+    }
+
+    async function setLed(id, mode, period_ms) {
+      const slider = document.getElementById(`led${id}Slider`);
+      const period = period_ms || (slider ? parseInt(slider.value) : 500);
+      updateLedCard(id, mode, period);
+
+      try {
+        const res = await fetch('/api/led', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({led: id, mode: mode, period_ms: period})
+        });
+        const data = await res.json();
+        if (data.ok && data.leds && data.leds[String(id)]) {
+          const l = data.leds[String(id)];
+          updateLedCard(id, l.mode, l.period_ms);
+        }
+      } catch (err) {
+        console.error('Error setting LED:', err);
+      }
+    }
+
+    function onLedSliderInput(id, val) {
+      const hz = (1000 / val).toFixed(1);
+      const periodVal = document.getElementById(`led${id}PeriodVal`);
+      if (periodVal) periodVal.innerText = `${val} ms (${hz} Hz)`;
+    }
+
+    function onLedSliderChange(id, val) {
+      clearTimeout(ledSlidersDebounce[id]);
+      ledSlidersDebounce[id] = setTimeout(() => {
+        setLed(id, 'BLINK', parseInt(val));
+      }, 50);
+    }
+
+    function setLedFreq(id, period_ms) {
+      const slider = document.getElementById(`led${id}Slider`);
+      if (slider) slider.value = period_ms;
+      onLedSliderInput(id, period_ms);
+      setLed(id, 'BLINK', period_ms);
+    }
+
     async function fetchStatus() {
       try {
         const res = await fetch('/api/status');
@@ -1045,19 +1662,19 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
         if (data.temp_c !== undefined) {
           tempVal.innerText = `${data.temp_c.toFixed(1)} °C`;
           if (data.temp_c < 32) {
-            tempVal.style.color = '#38bdf8'; // Blue
+            tempVal.style.color = '#38bdf8';
             tempStatus.innerText = 'Fresco (< 32°C)';
           } else if (data.temp_c < 36) {
-            tempVal.style.color = '#06b6d4'; // Cyan
+            tempVal.style.color = '#06b6d4';
             tempStatus.innerText = 'Normale (32-36°C)';
           } else if (data.temp_c < 42) {
-            tempVal.style.color = '#22c55e'; // Green
+            tempVal.style.color = '#22c55e';
             tempStatus.innerText = 'Ottimale (36-42°C)';
           } else if (data.temp_c < 50) {
-            tempVal.style.color = '#eab308'; // Amber
+            tempVal.style.color = '#eab308';
             tempStatus.innerText = 'Tiepido (42-50°C)';
           } else {
-            tempVal.style.color = '#ef4444'; // Red
+            tempVal.style.color = '#ef4444';
             tempStatus.innerText = 'Attenzione (> 50°C)';
           }
         }
@@ -1070,14 +1687,13 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
         currentBrightness = data.brightness;
         currentMode = data.mode;
         brightVal.innerText = `${currentBrightness}%`;
-        brightSlider.value = currentBrightness;
+        if (!brightSlider.matches(':active')) brightSlider.value = currentBrightness;
         setModeButtonActive(currentMode);
 
         if (data.mode === 'MANUAL') {
           currentR = data.r; currentG = data.g; currentB = data.b;
           updateOrb(currentR, currentG, currentB, currentBrightness);
         } else if (data.mode === 'TEMP') {
-          // Calculate approx color from temp
           if (data.temp_c < 32) updateOrb(0, 50, 255, currentBrightness);
           else if (data.temp_c < 36) updateOrb(0, 255, 200, currentBrightness);
           else if (data.temp_c < 42) updateOrb(0, 255, 30, currentBrightness);
@@ -1087,31 +1703,25 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
           updateOrb(0, 0, 0, 0);
         }
 
-        // Update Wi-Fi & LED 3 indicator state
-        const led3Dot = document.getElementById('led3Dot');
-        const led3Text = document.getElementById('led3Text');
+        // Update 3 Status LEDs
+        if (data.leds) {
+          for (let i = 1; i <= 3; i++) {
+            const l = data.leds[String(i)];
+            if (l) updateLedCard(i, l.mode, l.period_ms);
+          }
+        }
+
+        // Update Wi-Fi badge
         const wifiBadge = document.getElementById('wifiBadge');
         if (data.wifi_connected) {
-          if (led3Dot) {
-            led3Dot.style.background = '#22c55e';
-            led3Dot.style.boxShadow = '0 0 10px #22c55e';
-          }
-          if (led3Text) {
-            led3Text.style.color = '#22c55e';
-            led3Text.innerText = 'Acceso Fisso (Wi-Fi Connesso)';
-          }
           if (wifiBadge) {
             wifiBadge.innerText = 'Connesso: ' + (data.wifi_ssid || 'Vodafone-30456263');
             wifiBadge.style.color = '#22c55e';
           }
         } else {
-          if (led3Dot) {
-            led3Dot.style.background = '#eab308';
-            led3Dot.style.boxShadow = '0 0 10px #eab308';
-          }
-          if (led3Text) {
-            led3Text.style.color = '#eab308';
-            led3Text.innerText = 'Lampeggio 0.5s (In attesa)';
+          if (wifiBadge) {
+            wifiBadge.innerText = 'Disconnesso / SoftAP';
+            wifiBadge.style.color = '#eab308';
           }
         }
       } catch (err) {
@@ -1210,7 +1820,7 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
         const data = await res.json();
         if (data.ok && data.networks) {
           listContainer.style.display = 'flex';
-          countLabel.innerText = `${data.networks.length} reti trovate`;
+          countLabel.innerText = `${data.networks.length} reti rilevate`;
           list.innerHTML = '';
           data.networks.forEach(net => {
             const item = document.createElement('div');
@@ -1247,7 +1857,7 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
         alert('Errore durante la scansione Wi-Fi: ' + err.message);
       } finally {
         btn.disabled = false;
-        btn.innerHTML = '🔍 Cerca Reti Visibili al Tuya';
+        btn.innerHTML = '🔍 Cerca Reti Wi-Fi Visibili al Tuya';
       }
     }
 
@@ -1303,7 +1913,40 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
         msgBox.innerText = 'Errore di connessione: ' + err.message;
       } finally {
         btn.disabled = false;
-        btn.innerText = '🚀 Invia Configurazione al Tuya (Push Wi-Fi)';
+        btn.innerText = '🚀 Invia Configurazione al Tuya (Push Wi-Fi & Salva)';
+      }
+    async function disconnectWifiLan() {
+      const btn = document.getElementById('btnDisconnectWifi');
+      const msg = document.getElementById('disconnectMsg');
+      btn.disabled = true;
+      btn.innerText = '⏳ Disconnessione in corso...';
+      try {
+        const res = await fetch('/api/wifi/disconnect', { method: 'POST' });
+        const d = await res.json();
+        msg.style.display = 'block';
+        if (d.ok) {
+          msg.style.background = 'rgba(234, 179, 8, 0.2)';
+          msg.style.color = '#eab308';
+          msg.innerText = '✅ Disconnesso dalla LAN! Wi-Fi Tuya-TYDE3-AP attivo per pairing da cellulare. LED 3 lampeggia a 0.5s.';
+          const badge = document.getElementById('wifiBadge');
+          if (badge) {
+            badge.innerText = 'Disconnesso / SoftAP';
+            badge.style.color = '#eab308';
+          }
+        } else {
+          msg.style.background = 'rgba(239, 68, 68, 0.2)';
+          msg.style.color = '#ef4444';
+          msg.innerText = '❌ Errore: ' + (d.error || 'Impossibile disconnettere');
+        }
+        fetchStatus();
+      } catch (err) {
+        msg.style.display = 'block';
+        msg.style.background = 'rgba(239, 68, 68, 0.2)';
+        msg.style.color = '#ef4444';
+        msg.innerText = 'Errore di connessione: ' + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.innerText = '📱 Disconnetti dalla LAN & Rendi Visibile per Cellulare';
       }
     }
 

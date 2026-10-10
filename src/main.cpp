@@ -30,8 +30,42 @@ static float current_temp_c = 25.0f;
 
 // --- Wi-Fi Connection & LED3 Status Tracking ---
 static bool wifi_connected = false;
-static uint32_t last_wifi_blink = 0;
-static bool wifi_blink_state = false;
+
+// --- Individual Control for the 3 On-Board Status LEDs ---
+struct StatusLed {
+    uint8_t mode;        // 0 = OFF, 1 = ON (Solid), 2 = BLINK
+    uint16_t period_ms;  // Blink period in milliseconds (toggle interval)
+    uint32_t last_toggle;
+    bool state;
+};
+
+static StatusLed leds[3] = {
+    {2, 500, 0, false}, // LED 1 (PB6)
+    {1, 500, 0, true},  // LED 2 (PB5)
+    {2, 500, 0, false}  // LED 3 (TYWE1S / PB4 / PC13)
+};
+
+void set_led_ctrl(uint8_t id, uint8_t mode, uint16_t period_ms) {
+    if (id < 1 || id > 3) return;
+    uint8_t idx = id - 1;
+    leds[idx].mode = mode;
+    leds[idx].period_ms = period_ms > 0 ? period_ms : 500;
+    leds[idx].state = (mode == 1);
+
+    uint8_t lvl = (mode == 1) ? LOW : HIGH;
+    if (id == 1) {
+        digitalWrite(PIN_LED1, lvl);
+    } else if (id == 2) {
+        digitalWrite(PIN_LED2, lvl);
+    } else if (id == 3) {
+        digitalWrite(PB4, lvl);
+        digitalWrite(PC13, lvl);
+        char l_cmd[32];
+        const char* m_str = (mode == 0) ? "OFF" : ((mode == 1) ? "ON" : "BLINK");
+        snprintf(l_cmd, sizeof(l_cmd), "L:3,%s,%d\r\n", m_str, leds[idx].period_ms);
+        Serial3.print(l_cmd);
+    }
+}
 
 // --- Brightness Control State ---
 static uint8_t current_brightness = 20; // Default 20% (comfortable, not blinding)
@@ -252,6 +286,7 @@ void loop() {
                 } else if (val.startsWith("WIFI:") || val.startsWith("W:")) {
                     int w_val = val.substring(val.indexOf(':') + 1).toInt();
                     wifi_connected = (w_val == 1);
+                    set_led_ctrl(3, wifi_connected ? 1 : 2, 500);
                     Serial.print(wifi_connected ? "WIFI:OK:CONNECTED\r\n" : "WIFI:OK:DISCONNECTED\r\n");
                 } else if (val.startsWith("BRIGHT:") || val.startsWith("B:")) {
                     int b_idx = val.indexOf(':');
@@ -278,14 +313,53 @@ void loop() {
                 }
                 continue;
             }
-        } else if (c == 'W' || c == 'w') {
-            // Wi-Fi credentials command: W:<ssid>,<password>
+        } else if (c == 'L' || c == 'l') {
+            // LED command: L:<id>,<mode>,<period> or L:?
             String cmd = Serial.readStringUntil('\n');
             cmd.trim();
-            if (cmd.startsWith("W:") || cmd.startsWith("w:")) {
+            if (cmd == "L:?" || cmd == "l:?") {
+                char qbuf[96];
+                snprintf(qbuf, sizeof(qbuf), "LED:1=%d,%d;2=%d,%d;3=%d,%d\r\n",
+                         leds[0].mode, leds[0].period_ms,
+                         leds[1].mode, leds[1].period_ms,
+                         leds[2].mode, leds[2].period_ms);
+                Serial.print(qbuf);
+            } else if (cmd.startsWith("L:") || cmd.startsWith("l:")) {
+                String val = cmd.substring(2);
+                int first_comma = val.indexOf(',');
+                int second_comma = val.indexOf(',', first_comma + 1);
+                if (first_comma > 0) {
+                    int id = val.substring(0, first_comma).toInt();
+                    String m_str = (second_comma > 0) ? val.substring(first_comma + 1, second_comma) : val.substring(first_comma + 1);
+                    int period = (second_comma > 0) ? val.substring(second_comma + 1).toInt() : 500;
+                    m_str.toUpperCase();
+                    m_str.trim();
+                    uint8_t mode = 0;
+                    if (m_str == "ON" || m_str == "1") mode = 1;
+                    else if (m_str == "BLINK" || m_str == "2") mode = 2;
+                    else mode = 0;
+                    set_led_ctrl(id, mode, period);
+                    Serial.print("LED:OK\r\n");
+                } else {
+                    Serial.print("LED:ERR\r\n");
+                }
+            }
+            continue;
+        } else if (c == 'W' || c == 'w') {
+            // Wi-Fi commands: W:<ssid>,<password> or W:DISCONNECT
+            String cmd = Serial.readStringUntil('\n');
+            cmd.trim();
+            if (cmd.equalsIgnoreCase("W:DISCONNECT") || cmd.equalsIgnoreCase("W:RESET")) {
+                Serial3.print("W:DISCONNECT\r\n");
+                wifi_connected = false;
+                set_led_ctrl(3, 2, 500); // Active Low: 0.5s Blink (Waiting for pairing)
+                Serial.print("WIFI:OK:DISCONNECTED\r\n");
+                continue;
+            } else if (cmd.startsWith("W:") || cmd.startsWith("w:")) {
                 Serial3.print(cmd);
                 Serial3.print("\r\n");
-                wifi_connected = true; // Set connected state on push
+                wifi_connected = true;
+                set_led_ctrl(3, 1, 0);
                 Serial.print("WIFI:CONFIG_SENT\r\n");
                 continue;
             }
@@ -309,8 +383,23 @@ void loop() {
             s3_line.trim();
             if (s3_line.indexOf("WIFI:CONNECTED") >= 0) {
                 wifi_connected = true;
+                set_led_ctrl(3, 1, 0);
             } else if (s3_line.indexOf("WIFI:DISCONNECTED") >= 0) {
                 wifi_connected = false;
+                set_led_ctrl(3, 2, 500);
+            } else if (s3_line.startsWith("L:") || s3_line.startsWith("l:")) {
+                String val = s3_line.substring(2);
+                int first_comma = val.indexOf(',');
+                int second_comma = val.indexOf(',', first_comma + 1);
+                if (first_comma > 0) {
+                    int id = val.substring(0, first_comma).toInt();
+                    String m_str = (second_comma > 0) ? val.substring(first_comma + 1, second_comma) : val.substring(first_comma + 1);
+                    int period = (second_comma > 0) ? val.substring(second_comma + 1).toInt() : 500;
+                    m_str.toUpperCase();
+                    m_str.trim();
+                    uint8_t mode = (m_str == "ON" || m_str == "1") ? 1 : ((m_str == "BLINK" || m_str == "2") ? 2 : 0);
+                    set_led_ctrl(id, mode, period);
+                }
             }
             s3_line = "";
         } else if (c != '\r') {
@@ -318,11 +407,22 @@ void loop() {
         }
     }
 
-    // --- 3. Heartbeat on LED2 (PB5): Toggle every 500ms ---
+    // --- 3. Individual Status LEDs 1, 2, 3 Scheduler ---
     uint32_t now = millis();
-    if (now - last_heartbeat >= 500) {
-        last_heartbeat = now;
-        digitalWrite(PIN_LED2, !digitalRead(PIN_LED2));
+    for (int i = 0; i < 3; i++) {
+        if (leds[i].mode == 2) {
+            if (now - leds[i].last_toggle >= leds[i].period_ms) {
+                leds[i].last_toggle = now;
+                leds[i].state = !leds[i].state;
+                uint8_t lvl = leds[i].state ? LOW : HIGH;
+                if (i == 0) digitalWrite(PIN_LED1, lvl);
+                else if (i == 1) digitalWrite(PIN_LED2, lvl);
+                else if (i == 2) {
+                    digitalWrite(PB4, lvl);
+                    digitalWrite(PC13, lvl);
+                }
+            }
+        }
     }
 
     // --- 4. Periodic Temperature Update in TEMP mode (every 1s) ---
@@ -410,21 +510,4 @@ void loop() {
         key1_is_held = false;
     }
     last_key1_state = key1;
-
-    // --- 8. Wi-Fi Status LED Indicator (LED3 / LED1) ---
-    // User Requirement:
-    // "se tuya è connesso al wifi led 3 fisso, altrimento led 3 blink con frequenza 0,5 sec"
-    if (wifi_connected) {
-        digitalWrite(PIN_LED1, LOW); // Active Low: Solid ON (fisso)
-        digitalWrite(PB4, LOW);
-        digitalWrite(PC13, LOW);
-    } else {
-        if (now - last_wifi_blink >= 500) {
-            last_wifi_blink = now;
-            wifi_blink_state = !wifi_blink_state;
-            digitalWrite(PIN_LED1, wifi_blink_state ? LOW : HIGH);
-            digitalWrite(PB4, wifi_blink_state ? LOW : HIGH);
-            digitalWrite(PC13, wifi_blink_state ? LOW : HIGH);
-        }
-    }
 }
