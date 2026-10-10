@@ -4,6 +4,12 @@
  * @file board_pins.h
  * @brief Tuya TYDE 3.0 v1.0.3 Board Pinout & Peripheral Mapping
  * Target MCU: STM32F103C8T6 (72MHz ARM Cortex-M3, 64KB Flash, 20KB RAM)
+ * 
+ * Reconstructed 100% via binary disassembly of factory firmware (stm32_factory_tuya_backup.bin):
+ * - Status LEDs: PB6 (LED1), PB5 (LED2) (Active Low)
+ * - RGB LED: PB8 (Red), PB7 (Green), PB9 (Blue) (Active Low)
+ * - User Buttons: PA11 (Key1), PA12 (Key2) (Input Pull-Up)
+ * - Serial: PA9/PA10 (USART1), PB10/PB11 (USART3)
  */
 
 #include <Arduino.h>
@@ -17,18 +23,18 @@
 #define PIN_UART3_TX      PB10
 #define PIN_UART3_RX      PB11
 
-// --- On-Board Status LEDs (Active Low) ---
-#define PIN_LED1          PA2   // Wi-Fi Connection Status Indicator
-#define PIN_LED2          PA3   // MCU General Status Indicator
+// --- On-Board Status LEDs (Active Low: LOW = ON, HIGH = OFF) ---
+#define PIN_LED1          PB6   // LED1 (Wi-Fi Status Indicator)
+#define PIN_LED2          PB5   // LED2 (MCU Status / Heartbeat Indicator)
 
-// --- On-Board RGB LED (RGB彩灯 - Low-Side / PWM Driven) ---
-#define PIN_RGB_RED       PB0
-#define PIN_RGB_GREEN     PB1
-#define PIN_RGB_BLUE      PA1
+// --- On-Board RGB LED (RGB彩灯 - Active Low: LOW = ON, HIGH = OFF) ---
+#define PIN_RGB_RED       PB8   // Red Channel
+#define PIN_RGB_GREEN     PB7   // Green Channel
+#define PIN_RGB_BLUE      PB9   // Blue Channel
 
-// --- On-Board User Push Buttons (Active Low with Pull-Up) ---
-#define PIN_KEY1          PA0   // 按键1: Mode / Toggle / Pairing Trigger
-#define PIN_KEY2          PA4   // 按键2: Test / Color Cycle Trigger
+// --- On-Board User Push Buttons (Active Low with Pull-Up: LOW = Pressed) ---
+#define PIN_KEY1          PA11  // 按键1: Mode / Toggle / Pairing Trigger
+#define PIN_KEY2          PA12  // 按键2: Test / Color Cycle Trigger
 
 // --- Internal Sensor ADC Channels ---
 // ADC1_IN16: Internal Core Temperature Sensor
