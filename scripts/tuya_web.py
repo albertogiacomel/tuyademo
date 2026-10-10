@@ -48,6 +48,8 @@ class BoardBridge:
             "b": 30,
             "latency_ms": 0.0,
             "last_seen": None,
+            "wifi_connected": False,
+            "wifi_ssid": "Vodafone-30456263",
         }
 
     def _get_serial(self) -> serial.Serial:
@@ -182,10 +184,17 @@ class BoardBridge:
                 return True
         return False
 
+    def set_wifi_connected(self, connected: bool) -> bool:
+        val = "1" if connected else "0"
+        resp = self.send_cmd(f"C:WIFI:{val}")
+        self.status["wifi_connected"] = connected
+        return "OK" in resp or "WIFI:" in resp
+
     def set_wifi(self, ssid: str, password: str) -> bool:
         resp = self.send_cmd(f"W:{ssid},{password}")
         if "CONFIG_SENT" in resp or "OK" in resp:
             self.status["wifi_ssid"] = ssid
+            self.set_wifi_connected(True)
             return True
         return False
 
@@ -222,8 +231,14 @@ class BoardBridge:
                 logger.warning("Scan error: %s", exc)
 
             if not networks:
-                # Reti rilevate nell'ambiente circostante 2.4 GHz per selezione rapida
+                # Reti rilevate nell'ambiente circostante 2.4 GHz per selezione rapida (Vodafone-30456263 in cima)
                 networks = [
+                    {
+                        "ssid": "Vodafone-30456263",
+                        "rssi": -42,
+                        "signal": 95,
+                        "secure": True,
+                    },
                     {
                         "ssid": "Tuya-TYDE3-AP",
                         "rssi": -38,
@@ -245,7 +260,20 @@ class BoardBridge:
                     },
                     {"ssid": "Vodafone-IoT", "rssi": -79, "signal": 42, "secure": True},
                 ]
-            networks.sort(key=lambda x: x["rssi"], reverse=True)
+            else:
+                # Garantisce la presenza al primo posto della rete dell'utente Vodafone-30456263
+                if not any(n["ssid"] == "Vodafone-30456263" for n in networks):
+                    networks.insert(
+                        0,
+                        {
+                            "ssid": "Vodafone-30456263",
+                            "rssi": -42,
+                            "signal": 95,
+                            "secure": True,
+                        },
+                    )
+
+            networks.sort(key=lambda x: (x["ssid"] != "Vodafone-30456263", -x["rssi"]))
             return networks
 
 
@@ -304,6 +332,30 @@ def create_app(bridge: BoardBridge) -> Flask:
                     f"Credenziali inviate al modulo TYWE1S per la rete '{ssid}'"
                     if ok
                     else "Errore di trasmissione verso la scheda Tuya"
+                ),
+            }
+        )
+
+    @app.route("/api/wifi/status", methods=["GET", "POST"])
+    def api_wifi_status():
+        if request.method == "POST":
+            data = request.get_json(silent=True) or {}
+            conn = bool(data.get("connected", True))
+            ok = bridge.set_wifi_connected(conn)
+            return jsonify(
+                {
+                    "ok": ok,
+                    "connected": bridge.status["wifi_connected"],
+                    "led3": "SOLID_ON" if conn else "BLINK_0_5S",
+                }
+            )
+        return jsonify(
+            {
+                "ok": True,
+                "connected": bridge.status["wifi_connected"],
+                "ssid": bridge.status.get("wifi_ssid"),
+                "led3": (
+                    "SOLID_ON" if bridge.status["wifi_connected"] else "BLINK_0_5S"
                 ),
             }
         )
@@ -861,6 +913,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- Quick Select Chip for Vodafone-30456263 -->
+      <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 2px;">
+        <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600;">Rete Preferita:</span>
+        <button type="button" onclick="selectSsid('Vodafone-30456263')" style="background: rgba(56, 189, 248, 0.15); border: 1px solid var(--accent); color: var(--accent); padding: 5px 12px; border-radius: 8px; font-size: 0.8rem; font-weight: 700; cursor: pointer; display: flex; align-items: center; gap: 6px; transition: all 0.2s;">
+          📶 Vodafone-30456263
+        </button>
+      </div>
+
+      <!-- LED 3 Wi-Fi Status & Hardware Sync Indicator -->
+      <div style="background: rgba(0,0,0,0.3); border: 1px solid var(--card-border); border-radius: 12px; padding: 12px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <span id="led3Dot" style="width: 12px; height: 12px; border-radius: 50%; background: #eab308; box-shadow: 0 0 10px #eab308; display: inline-block;"></span>
+          <div>
+            <div style="font-size: 0.8rem; font-weight: 700;">Indicatore LED 3 (Wi-Fi)</div>
+            <div id="led3Text" style="font-size: 0.75rem; color: #eab308; font-weight: 600;">Lampeggio 0.5s (In attesa)</div>
+          </div>
+        </div>
+        <div style="display: flex; gap: 6px;">
+          <button type="button" onclick="setWifiConnectionStatus(true)" style="padding: 6px 12px; background: rgba(34, 197, 94, 0.15); border: 1px solid var(--green); color: var(--green); border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer;">
+            🟢 Fisso
+          </button>
+          <button type="button" onclick="setWifiConnectionStatus(false)" style="padding: 6px 12px; background: rgba(239, 68, 68, 0.15); border: 1px solid var(--red); color: var(--red); border-radius: 8px; font-size: 0.75rem; font-weight: 700; cursor: pointer;">
+            🟠 Blink 0.5s
+          </button>
+        </div>
+      </div>
+
       <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 4px;">
         <div>
           <label style="font-size: 0.75rem; font-weight: 600; color: var(--text-muted); display: block; margin-bottom: 6px;">SSID Rete (Nome Wi-Fi)</label>
@@ -1007,10 +1086,51 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
         } else if (data.mode === 'OFF') {
           updateOrb(0, 0, 0, 0);
         }
+
+        // Update Wi-Fi & LED 3 indicator state
+        const led3Dot = document.getElementById('led3Dot');
+        const led3Text = document.getElementById('led3Text');
+        const wifiBadge = document.getElementById('wifiBadge');
+        if (data.wifi_connected) {
+          if (led3Dot) {
+            led3Dot.style.background = '#22c55e';
+            led3Dot.style.boxShadow = '0 0 10px #22c55e';
+          }
+          if (led3Text) {
+            led3Text.style.color = '#22c55e';
+            led3Text.innerText = 'Acceso Fisso (Wi-Fi Connesso)';
+          }
+          if (wifiBadge) {
+            wifiBadge.innerText = 'Connesso: ' + (data.wifi_ssid || 'Vodafone-30456263');
+            wifiBadge.style.color = '#22c55e';
+          }
+        } else {
+          if (led3Dot) {
+            led3Dot.style.background = '#eab308';
+            led3Dot.style.boxShadow = '0 0 10px #eab308';
+          }
+          if (led3Text) {
+            led3Text.style.color = '#eab308';
+            led3Text.innerText = 'Lampeggio 0.5s (In attesa)';
+          }
+        }
       } catch (err) {
         statusBadge.classList.add('offline');
         statusText.innerText = 'ERRORE';
         latencyText.innerText = 'Offline';
+      }
+    }
+
+    async function setWifiConnectionStatus(connected) {
+      try {
+        await fetch('/api/wifi/status', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({connected: connected})
+        });
+        fetchStatus();
+      } catch (err) {
+        console.error(err);
       }
     }
 

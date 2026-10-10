@@ -506,6 +506,57 @@ def backup_esp(
         sys.exit(res.returncode)
 
 
+@app.command(name="flash-esp")
+def flash_esp(
+    port: Annotated[
+        str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
+    ] = DEFAULT_PORT,
+    baud: Annotated[
+        int, Parameter(name=["-b", "--baud"], help="Baud rate")
+    ] = DEFAULT_BAUD,
+    attempts: Annotated[
+        int, Parameter(name=["-a", "--attempts"], help="Tentativi di connessione")
+    ] = 30,
+) -> None:
+    """Carica il firmware Wi-Fi C++ PlatformIO (tywe1s_wifi_firmware.bin) sul modulo TYWE1S via esptool."""
+    bin_file = FIRMWARE_DIR / "tywe1s_wifi_firmware.bin"
+    if not bin_file.exists():
+        print(f"[-] File binario non trovato: {bin_file}")
+        sys.exit(1)
+    cmd = [
+        sys.executable,
+        "-m",
+        "esptool",
+        "-p",
+        port,
+        "-c",
+        "esp8266",
+        "-b",
+        str(baud),
+        "--before",
+        "no-reset",
+        "-a",
+        "no-reset",
+        "--connect-attempts",
+        str(attempts),
+        "write_flash",
+        "0x0",
+        str(bin_file),
+    ]
+    print(
+        f"[{get_timestamp()}] Avvio scrittura flash TYWE1S (ESP8266) con {bin_file.name}..."
+    )
+    print(
+        ">>> SUGGERIMENTO: Mentre esptool tenta la connessione, tieni premuto S3: WIFI BOOT e clicca S4: WIFI RST!"
+    )
+    res = subprocess.run(cmd, check=False)
+    if res.returncode != 0:
+        sys.exit(res.returncode)
+    print(
+        f"[{get_timestamp()}] Flashing TYWE1S completato con successo! Clicca S4: WIFI RST per avviare."
+    )
+
+
 @app.command(name="serve")
 def serve(
     host: Annotated[

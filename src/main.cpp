@@ -28,6 +28,11 @@ static uint16_t rainbow_hue = 0;
 static bool last_key2_state = HIGH;
 static float current_temp_c = 25.0f;
 
+// --- Wi-Fi Connection & LED3 Status Tracking ---
+static bool wifi_connected = false;
+static uint32_t last_wifi_blink = 0;
+static bool wifi_blink_state = false;
+
 // --- Brightness Control State ---
 static uint8_t current_brightness = 20; // Default 20% (comfortable, not blinding)
 static int8_t brightness_dir = -1;      // -1 = dimming, +1 = brightening
@@ -169,8 +174,12 @@ void setup() {
     // Configure status LEDs (Active Low)
     pinMode(PIN_LED1, OUTPUT);
     pinMode(PIN_LED2, OUTPUT);
-    digitalWrite(PIN_LED1, HIGH); // OFF
+    pinMode(PB4, OUTPUT);
+    pinMode(PC13, OUTPUT);
+    digitalWrite(PIN_LED1, HIGH); // OFF initially
     digitalWrite(PIN_LED2, LOW);  // ON (MCU Alive)
+    digitalWrite(PB4, HIGH);
+    digitalWrite(PC13, HIGH);
 
     // Configure user buttons
     pinMode(PIN_KEY1, INPUT_PULLUP);
@@ -240,6 +249,10 @@ void loop() {
                     current_rgb_mode = RGB_MODE_OFF;
                     set_rgb_pwm(0, 0, 0);
                     Serial.print("RGB:OFF\r\n");
+                } else if (val.startsWith("WIFI:") || val.startsWith("W:")) {
+                    int w_val = val.substring(val.indexOf(':') + 1).toInt();
+                    wifi_connected = (w_val == 1);
+                    Serial.print(wifi_connected ? "WIFI:OK:CONNECTED\r\n" : "WIFI:OK:DISCONNECTED\r\n");
                 } else if (val.startsWith("BRIGHT:") || val.startsWith("B:")) {
                     int b_idx = val.indexOf(':');
                     int b_val = val.substring(b_idx + 1).toInt();
@@ -272,6 +285,7 @@ void loop() {
             if (cmd.startsWith("W:") || cmd.startsWith("w:")) {
                 Serial3.print(cmd);
                 Serial3.print("\r\n");
+                wifi_connected = true; // Set connected state on push
                 Serial.print("WIFI:CONFIG_SENT\r\n");
                 continue;
             }
@@ -286,10 +300,22 @@ void loop() {
         Serial3.write((uint8_t)c);
     }
 
-    // --- 2. Forward from Wi-Fi (Serial3) to PC (Serial) ---
+    // --- 2. Forward from Wi-Fi (Serial3) to PC (Serial) & Detect Wi-Fi Status ---
+    static String s3_line = "";
     while (Serial3.available()) {
         int c = Serial3.read();
         Serial.write((uint8_t)c);
+        if (c == '\n') {
+            s3_line.trim();
+            if (s3_line.indexOf("WIFI:CONNECTED") >= 0) {
+                wifi_connected = true;
+            } else if (s3_line.indexOf("WIFI:DISCONNECTED") >= 0) {
+                wifi_connected = false;
+            }
+            s3_line = "";
+        } else if (c != '\r') {
+            if (s3_line.length() < 64) s3_line += (char)c;
+        }
     }
 
     // --- 3. Heartbeat on LED2 (PB5): Toggle every 500ms ---
@@ -343,7 +369,6 @@ void loop() {
         // Button 1 just pressed down
         key1_press_start = now;
         key1_is_held = false;
-        digitalWrite(PIN_LED1, LOW); // LED1 on as feedback
     } else if (key1 == LOW && last_key1_state == LOW) {
         // Button 1 is continuously being held
         if (!key1_is_held && (now - key1_press_start >= 350)) {
@@ -383,7 +408,23 @@ void loop() {
             brightness_dir = -brightness_dir;
         }
         key1_is_held = false;
-        digitalWrite(PIN_LED1, HIGH); // LED1 off
     }
     last_key1_state = key1;
+
+    // --- 8. Wi-Fi Status LED Indicator (LED3 / LED1) ---
+    // User Requirement:
+    // "se tuya è connesso al wifi led 3 fisso, altrimento led 3 blink con frequenza 0,5 sec"
+    if (wifi_connected) {
+        digitalWrite(PIN_LED1, LOW); // Active Low: Solid ON (fisso)
+        digitalWrite(PB4, LOW);
+        digitalWrite(PC13, LOW);
+    } else {
+        if (now - last_wifi_blink >= 500) {
+            last_wifi_blink = now;
+            wifi_blink_state = !wifi_blink_state;
+            digitalWrite(PIN_LED1, wifi_blink_state ? LOW : HIGH);
+            digitalWrite(PB4, wifi_blink_state ? LOW : HIGH);
+            digitalWrite(PC13, wifi_blink_state ? LOW : HIGH);
+        }
+    }
 }

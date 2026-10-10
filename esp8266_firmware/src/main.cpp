@@ -26,7 +26,6 @@ static float cached_vdd = 3.30f;
 static uint8_t cached_brightness = 20;
 static String cached_mode = "TEMP";
 static uint8_t cached_r = 0, cached_g = 255, cached_b = 30;
-static uint32_t last_temp_poll = 0;
 
 void sendCommandToStm32(const String& cmd) {
     Serial.println(cmd);
@@ -229,9 +228,18 @@ void handleApiWifiScan() {
     server.send(200, "application/json", json);
 }
 
+// Candidate GPIO pins on TYWE1S for LED3 (Active Low)
+static const uint8_t LED_PINS[] = {4, 5, 12, 13, 14};
+
 void setup() {
     Serial.begin(115200);
     delay(100);
+
+    // Setup LED pins (Active Low: HIGH = OFF initially)
+    for (uint8_t p : LED_PINS) {
+        pinMode(p, OUTPUT);
+        digitalWrite(p, HIGH);
+    }
 
     // Setup Soft Access Point
     WiFi.mode(WIFI_AP_STA);
@@ -251,6 +259,22 @@ void setup() {
 
 void loop() {
     server.handleClient();
+
+    // Wi-Fi Status Indicator on LED3:
+    // If connected -> Solid ON (LOW). If not connected -> Blink every 0.5s (500ms).
+    bool is_conn = (WiFi.status() == WL_CONNECTED);
+    static bool last_conn_state = false;
+    if (is_conn != last_conn_state) {
+        last_conn_state = is_conn;
+        Serial.println(is_conn ? "WIFI:CONNECTED" : "WIFI:DISCONNECTED");
+    }
+
+    if (is_conn) {
+        for (uint8_t p : LED_PINS) digitalWrite(p, LOW); // Active Low: Solid ON
+    } else {
+        bool blk = ((millis() / 500) % 2 == 0);
+        for (uint8_t p : LED_PINS) digitalWrite(p, blk ? LOW : HIGH); // 0.5s Blink
+    }
 
     // Check for commands from STM32 over Serial (USART3)
     if (Serial.available()) {
