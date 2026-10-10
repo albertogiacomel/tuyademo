@@ -47,13 +47,21 @@ flowchart TD
 ```text
 tuya_dev_kit/
 ├── README.md                          # Master documentation (questo file)
-├── requirements.txt                   # Dipendenze Python (pyserial, esptool, keystone, etc.)
+├── platformio.ini                     # Configurazione build PlatformIO Core (STM32 + ESP8266)
+├── requirements.txt                   # Dipendenze Python (cyclopts, platformio, pyserial, esptool, etc.)
+│
+├── include/                           # Header C++ di progetto
+│   └── board_pins.h                   # Mappatura pin e periferiche della scheda TYDE 3.0
+│
+├── src/                               # Codice sorgente C++ firmware
+│   └── main.cpp                       # Smart Bridge C++ con lettura ADC1_IN16 e passthrough UART
 │
 ├── firmware/                          # Binari firmware verificati
 │   ├── stm32_factory_tuya_backup.bin  # Dump originale di fabbrica Tuya (64 KiB, backup integrale)
-│   ├── stm32_uart_smart_bridge.bin    # Smart Bridge con ping '?' e auto-recovery ORE (256B)
-│   ├── stm32_uart_pure_bridge_v2.bin  # Pure Bridge bidirezionale con recovery ORE (512B)
-│   └── stm32_uart_echo_bridge.bin     # Echo Bridge diagnostico (256B)
+│   ├── stm32_pio_smart_bridge.bin     # Firmware C++ PlatformIO con ADC1_IN16 e smart passthrough (20.660 B)
+│   ├── stm32_uart_smart_bridge.bin    # Smart Bridge bare-metal Thumb assembler (512 B)
+│   ├── stm32_uart_pure_bridge_v2.bin  # Pure Bridge bidirezionale con recovery ORE (512 B)
+│   └── stm32_uart_echo_bridge.bin     # Echo Bridge diagnostico (256 B)
 │
 ├── hardware/                          # Schemi e foto PCB ad alta risoluzione
 │   ├── zoom_p2.png                    # Dettaglio connettore P2 (USB <-> STM32)
@@ -62,9 +70,9 @@ tuya_dev_kit/
 │   ├── top_right_wifi.png             # Dettaglio pulsanti WIFI BOOT / WIFI RST
 │   └── tyde3.0_9.png                  # Dettaglio pulsanti MCU RST / MCU BOOT
 │
-├── scripts/                           # Toolchain CLI & build scripts
-│   ├── tuya_cli.py                    # Master CLI unificata per operazioni sulla scheda
-│   └── build_bridges.py               # Compilatore assembler idempotente (Keystone + Capstone)
+├── scripts/                           # Toolchain CLI & build scripts (Cyclopts-powered)
+│   ├── tuya_cli.py                    # Master CLI unificata per build, flash, ping e test
+│   └── build_bridges.py               # Compilatore assembler bare-metal idempotente (Keystone + Capstone)
 │
 └── docs/                              # Documentazione tecnica approfondita
     ├── HARDWARE.md                    # Specifiche hardware, pinout, matrice jumper e pulsanti
@@ -77,7 +85,26 @@ tuya_dev_kit/
 
 ## ⚡ 3. Quick Start — Comandi Principali
 
-Tutti i comandi possono essere eseguiti direttamente dalla cartella di progetto:
+Tutti i comandi sono governati dalla master CLI Cyclopts (`python scripts/tuya_cli.py`):
+
+### Compilazione Firmware C++ (PlatformIO Core):
+```powershell
+python scripts/tuya_cli.py build-pio
+```
+*Compila `src/main.cpp` con GCC ARM ed esporta il binario verificato in `firmware/stm32_pio_smart_bridge.bin`.*
+
+### Flashing Firmware C++ su STM32:
+```powershell
+# 1. Tenere premuto MCU BOOT (S2), cliccare MCU RST (S1), rilasciare MCU BOOT
+python scripts/tuya_cli.py flash-pio
+# 2. Cliccare MCU RST (S1) per avviare il firmware
+```
+
+### Lettura Sensore Temperatura Interno (ADC1_IN16 + VREFINT):
+```powershell
+python scripts/tuya_cli.py read-temp
+```
+*Interroga la telemetria on-die: calcola la reale tensione VDD e la temperatura in °C.*
 
 ### Test di Connessione e Salute Bridge:
 ```powershell
@@ -108,21 +135,22 @@ python scripts/tuya_cli.py restore-factory
 
 ## 📊 4. Tabella di Verifica e Integrità Artefatti
 
-| File Artefatto | Dimensione | Target Hardware | Stato / Validazione |
+| File Artefatto | Dimensione | Target Hardware | SHA256 / Note |
 | :--- | :---: | :--- | :--- |
-| `firmware/stm32_factory_tuya_backup.bin` | 65.536 B (64 KiB) | STM32 Flash (`0x08000000`) | ✅ Dump integrale verificato; Vector Table: SP `0x20000800`, PC `0x0800084D` |
-| `firmware/stm32_uart_smart_bridge.bin` | 256 B | STM32 Flash (`0x08000000`) | ✅ Testato live; ping `OK\n` superato; recovery ORE verificato su burst 74880 baud |
-| `firmware/stm32_uart_echo_bridge.bin` | 256 B | STM32 Flash (`0x08000000`) | ✅ Testato live; byte-for-byte echo `HELLO_STM32_BRIDGE` confermato |
-| `scripts/tuya_cli.py` | ~6.5 KiB | Python 3.10+ | ✅ Eseguibile, conforme R49 (UTF-8 esplicito), zero dipendenze esterne oltre pyserial |
-| `scripts/build_bridges.py` | ~5 KiB | Python 3.10+ | ✅ Compila ed esegue validazione statica disassemblato via Capstone Engine |
+| `firmware/stm32_factory_tuya_backup.bin` | 65.536 B (64 KiB) | STM32 Flash (`0x08000000`) | `012f2171366ef70ea2e1...` (Backup integrale di fabbrica) |
+| `firmware/stm32_pio_smart_bridge.bin` | 20.660 B | STM32 Flash (`0x08000000`) | `102c82be6a4e02a4e8a7...` (C++ PlatformIO: passthrough + ADC1_IN16) |
+| `firmware/stm32_uart_smart_bridge.bin` | 512 B | STM32 Flash (`0x08000000`) | `4dee3c41caee3a9c963e...` (Thumb-2 bare-metal JIT: passthrough + ADC16) |
+| `firmware/stm32_uart_echo_bridge.bin` | 256 B | STM32 Flash (`0x08000000`) | `a7224fedfe100917240c...` (Echo Bridge diagnostico) |
+| `scripts/tuya_cli.py` | ~11 KiB | Python 3.10+ (Cyclopts) | Master CLI universale, 0 warnings, ruff compliant |
+| `scripts/build_bridges.py` | ~6 KiB | Python 3.10+ (Keystone) | Compilatore assembler JIT e disassemblatore Capstone |
 
 ---
 
 ## 🎯 5. Conformità R66 (Systemic Implementation Discipline)
 
-1. **S1 Code**: Architettura bare-metal Thumb senza dipendenze pesanti, gestione trasparente dei registri periferici e azzeramento ORE/FE.
-2. **S2 Docs/Rules**: Documentazione completa, schemi visuali, tabella registri e runbook dettagliato.
+1. **S1 Code**: Supporto ibrido: C++ strutturato con PlatformIO Core per sviluppo esteso e Micro-Assembly Keystone per deploy istantaneo a zero toolchain.
+2. **S2 Docs/Rules**: Documentazione allineata con l'architettura 2026 di Daniel Vaughan per coding agents su sistemi vincolati.
 3. **S3 Coherence**: Allineamento completo tra layout PCB, posizioni jumper e indirizzamento UART STM32 (PA9/PA10 e PB10/PB11).
-4. **S4 Prevention**: Salvataggio preliminare del backup di fabbrica prima di qualsiasi scrittura flash; auto-recovery hardware dai deadlock di linea.
-5. **S5 Traceability**: Log diagnostici, timestamp UTC espliciti e mapping semantico di ogni segnale.
-6. **S6 Clean Integration**: Toolkit autonomo posizionato in `C:\Users\albyw\tuya_dev_kit`, zero file orfani, script di ricompilazione idempotente.
+4. **S4 Prevention**: Backup di fabbrica preservato; recovery automatico da ORE e gestione sicura delle eccezioni hardware.
+5. **S5 Traceability**: Tracciamento SHA256 per ogni file binario compilato; audit trail trasparente.
+6. **S6 Clean Integration**: Toolkit autonomo posizionato in `C:\Users\albyw\tuya_dev_kit`, zero file orfani, build riproducibile via `platformio.ini`.

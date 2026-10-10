@@ -10,6 +10,8 @@ Refactored to Cyclopts following SOUL_GLOBAL / QwenPaw / CoPaw methodology:
 
 from __future__ import annotations
 
+import hashlib
+import shutil
 import subprocess
 import sys
 import time
@@ -233,6 +235,61 @@ def flash_bridge(
         str(bin_file),
     ]
     print(f"[{get_timestamp()}] Esecuzione flash ponte STM32: {' '.join(cmd)}")
+    res = subprocess.run(cmd, check=False)
+    if res.returncode != 0:
+        sys.exit(res.returncode)
+
+
+@app.command(name="build-pio")
+def build_pio() -> None:
+    """Compila il firmware C++ STM32 tramite PlatformIO Core e aggiorna firmware/."""
+    print(f"[{get_timestamp()}] Compilazione firmware PlatformIO (stm32_bridge)...")
+    cmd = [sys.executable, "-m", "platformio", "run"]
+    res = subprocess.run(cmd, check=False)
+    if res.returncode != 0:
+        print("[-] Compilazione fallita.")
+        sys.exit(res.returncode)
+
+    src_bin = BASE_DIR / ".pio" / "build" / "stm32_bridge" / "firmware.bin"
+    dst_bin = FIRMWARE_DIR / "stm32_pio_smart_bridge.bin"
+    if src_bin.exists():
+        shutil.copy2(src_bin, dst_bin)
+        h = hashlib.sha256(dst_bin.read_bytes()).hexdigest()
+        print(
+            f"[+] Firmware C++ generato con successo: {dst_bin} ({dst_bin.stat().st_size} bytes)"
+        )
+        print(f"    SHA256: {h}")
+
+
+@app.command(name="flash-pio")
+def flash_pio(
+    port: Annotated[
+        str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
+    ] = DEFAULT_PORT,
+) -> None:
+    """Carica il firmware C++ PlatformIO (stm32_pio_smart_bridge.bin) su STM32 via stm32loader."""
+    bin_file = FIRMWARE_DIR / "stm32_pio_smart_bridge.bin"
+    if not bin_file.exists():
+        print(
+            f"[-] File non trovato: {bin_file}. Eseguire prima 'python scripts/tuya_cli.py build-pio'."
+        )
+        sys.exit(1)
+    cmd = [
+        sys.executable,
+        "-m",
+        "stm32loader",
+        "-p",
+        port,
+        "-f",
+        "F1",
+        "-e",
+        "-w",
+        "-v",
+        str(bin_file),
+    ]
+    print(
+        f"[{get_timestamp()}] Flashing PlatformIO C++ firmware su STM32: {' '.join(cmd)}"
+    )
     res = subprocess.run(cmd, check=False)
     if res.returncode != 0:
         sys.exit(res.returncode)
