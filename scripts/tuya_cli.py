@@ -22,6 +22,13 @@ from typing import Annotated
 import serial
 from cyclopts import App, Parameter
 
+# R49: Explicit UTF-8 console streams on Windows
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 FIRMWARE_DIR = BASE_DIR / "firmware"
 DEFAULT_PORT = "COM3"
