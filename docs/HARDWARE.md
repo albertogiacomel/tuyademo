@@ -87,3 +87,47 @@ Nell'angolo superiore destro della scheda è presente un header maschio standard
 | 3 | `TX1` | ESP8266 GPIO2 / UART1 TX (Debug log ESP) | 3.3V TTL |
 | 4 | `RX0` | ESP8266 UART0 RX (Ricezione flashing e MCU) | 3.3V TTL |
 | 5 | `TX0` | ESP8266 UART0 TX (Trasmissione flashing e MCU) | 3.3V TTL |
+
+---
+
+## 💡 5. Periferiche On-Board & Attuatori (Quadrante Inferiore Destro)
+
+La scheda è nativamente progettata come demo kit per illuminazione intelligente (Smart Lighting) e include i seguenti attuatori/indicatori:
+
+| Componente | Serigrafia PCB | Connessione Hardware | Funzione Operativa / Firmware Tuya Demo |
+| :--- | :--- | :--- | :--- |
+| **LED RGB Full-Color** | `RGB彩灯` | Canali `B` (Blu), `R` (Rosso), `G` (Verde) su GPIO/PWM STM32 | Indicatore di stato demo, simulazione lampada smart RGB, test colore |
+| **LED 1 (Verde/Blu)** | `LED1` | STM32 GPIO (Active Low) | Stato di rete Wi-Fi: Lampeggio rapido = SmartConfig, lento = AP mode |
+| **LED 2 (Verde/Giallo)** | `LED2` | STM32 GPIO (Active Low) | Indicatore diagnostico / stato utente |
+| **LED 3 (Rosso)** | `LED3` | TYWE1S GPIO (Active Low) | Stato modulo Wi-Fi / attività radio |
+| **LED 4 (Rosso)** | `LED4` | Rail 3.3V post-regolatore LDO | Indicatore alimentazione scheda (acceso fisso se alimentata) |
+| **Tasto Utente 1** | `按键1` | STM32 GPIO (Input pull-up) | Pressione singola: toggle/switch colori RGB; Pressione prolungata (5s): reset Wi-Fi & pairing |
+| **Tasto Utente 2** | `按键2` | STM32 GPIO (Input pull-up) | Pressione prolungata (>3s): test sequenziale ciclo colori RGB (R -> G -> B) |
+
+---
+
+## 🔍 6. Analisi Sensori On-Board ed Espandibilità
+
+### Sensori Fisici Integrati sulla PCB: **Nessuno (0)**
+Sulla scheda TYDE 3.0 v1.0.3 **non è presente alcun sensore fisico discreto saldato sulla PCB** (nessun sensore di temperatura ambientale, umidità, luminosità LDR, accelerometro o PIR).
+
+### Sensore Interno On-Die (STM32F103)
+L'unico sensore fisicamente presente nel silicio è il **sensore di temperatura interno dell'STM32F103C8T6**:
+* Canale interno: **`ADC1_IN16`**
+* Range operativo: da -40°C a +125°C
+* Tensione a 25°C: tipica ~1.43V
+* Pendenza media: ~4.3 mV/°C
+
+### Header di Espansione Sensori Esterni (14 pin in basso al centro)
+Per collegare sensori analogici o digitali esterni, la scheda espone un connettore a doppia fila 2x7 pin con alimentazione `3.3V` e `GND` dedicata:
+
+```text
+[ A1 ] [ A3 ] [ A5 ] [ A7 ] [ B1 ] [ B13 ] [ B15 ]  (Riga Superiore)
+[ A0 ] [ A2 ] [ A4 ] [ A6 ] [ B0 ] [ B12 ] [ B14 ]  (Riga Inferiore)
+```
+
+* **Ingressi Analogici (ADC)**: `PA0` - `PA7` (canali `ADC1_IN0` .. `ADC1_IN7`) e `PB0`, `PB1` (`ADC1_IN8`, `ADC1_IN9`) consentono di collegare fino a 10 sensori analogici (fotoresistenze LDR, sensori di umidità suolo, potenziometri, sensori di gas MQ-x).
+* **Interfacce Digitali**:
+  * **SPI1 Hardware**: `PA5` (SCK), `PA6` (MISO), `PA7` (MOSI), `PA4` (NSS) per display, termocoppie MAX6675, sensori BME280/BMP280 SPI.
+  * **I2C Bit-Bang / GPIO**: Qualsiasi coppia di pin (es. `PB12`/`PB13` o `PA1`/`PA2`) per sensori I2C (SHT30, AHT20, BMP280, MPU6050, BH1750).
+
