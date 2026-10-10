@@ -94,6 +94,8 @@ check_u3_err:
 
 Per garantire la massima affidabilità senza interrompere `esptool`:
 * Se il PC invia il byte ASCII **`?`** (`0x3F`): l'STM32 risponde direttamente `OK\n`. Questo permette al comando `python tuya_cli.py ping` di verificare istantaneamente la salute del runtime STM32.
+* Se il PC invia il byte ASCII **`T`** (`0x54`) o **`t`** (`0x74`): l'STM32 acquisisce il canale **`ADC1_IN16`** (temperatura die) e **`ADC1_IN17`** (tensione di riferimento interna VREFINT) e risponde istantaneamente con la stringa `T:<hex16>,V:<hex16>\n` (gestita dal comando `python tuya_cli.py read-temp`).
+* Se il PC invia il byte ASCII **`B`** (`0x42`): l'STM32 effettua un salto hardware diretto al bootloader ST in System ROM (`0x1FFFF000`).
 * Tutti gli altri pacchetti (inclusi i frame SLIP di `esptool` che iniziano e terminano con `0xC0`): vengono inoltrati trasparentemente senza alcuna alterazione o echo locale.
 
 ---
@@ -102,11 +104,15 @@ Per garantire la massima affidabilità senza interrompere `esptool`:
 
 | Registro | Indirizzo Fisico | Valore Scritto | Descrizione Funzionale |
 | :--- | :--- | :--- | :--- |
-| `RCC->APB2ENR` | `0x40021018` | `0x0000400C` | Abilita clock bus per `IOPAEN` (Port A), `IOPBEN` (Port B), `USART1EN` |
-| `RCC->APB1ENR` | `0x4002101C` | `0x00040000` | Abilita clock bus per `USART3EN` |
-| `GPIOA->CRH` | `0x40010804` | Nibble `0x4B` | PA9 = Alternate Function Push-Pull (50MHz), PA10 = Floating Input |
-| `GPIOB->CRH` | `0x40010C04` | Nibble `0x4B` | PB10 = Alternate Function Push-Pull (50MHz), PB11 = Floating Input |
-| `USART1->BRR` | `0x40013808` | `0x00000045` | Baudrate divisor per 115200 baud su HSI 8 MHz |
+| `RCC->APB2ENR` | `0x40021018` | `0x0000420C` | Abilita bus clock per `IOPAEN`, `IOPBEN`, `ADC1EN`, `USART1EN` |
+| `RCC->APB1ENR` | `0x4002101C` | `0x00040000` | Abilita bus clock per `USART3EN` |
+| `GPIOA->CRH` | `0x40010804` | Nibble `0x4B` | PA9 = AF-PP (50MHz), PA10 = Floating Input |
+| `GPIOB->CRH` | `0x40010C04` | Nibble `0x4B` | PB10 = AF-PP (50MHz), PB11 = Floating Input |
+| `USART1->BRR` | `0x40013808` | `0x00000045` | Divisore baudrate per 115200 baud su HSI 8 MHz |
 | `USART1->CR1` | `0x4001380C` | `0x0000200C` | Abilita USART, Trasmettitore e Ricevitore (`UE \| TE \| RE`) |
-| `USART3->BRR` | `0x40004808` | `0x00000045` | Baudrate divisor per 115200 baud su HSI 8 MHz |
+| `USART3->BRR` | `0x40004808` | `0x00000045` | Divisore baudrate per 115200 baud su HSI 8 MHz |
 | `USART3->CR1` | `0x4000480C` | `0x0000200C` | Abilita USART, Trasmettitore e Ricevitore (`UE \| TE \| RE`) |
+| `ADC1->SMPR1` | `0x4001240C` | `0x00FC0000` | Sample time Ch16 e Ch17 impostato a 239.5 cicli ADC (>17.1 µs richiesti) |
+| `ADC1->CR2` | `0x40012408` | `0x00800001` | Abilita ADC1 e sensore di temperatura (`TSVREFE \| ADON`) + calibrazione |
+| `ADC1->SQR3` | `0x40012434` | `0x00000010` / `0x11` | Selezione canale di conversione (16 = Temp, 17 = Vrefint) |
+

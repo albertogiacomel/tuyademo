@@ -76,6 +76,71 @@ def ping(
         sys.exit(2)
 
 
+@app.command(name="read-temp")
+def read_temp(
+    port: Annotated[
+        str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
+    ] = DEFAULT_PORT,
+    baud: Annotated[
+        int, Parameter(name=["-b", "--baud"], help="Baud rate")
+    ] = DEFAULT_BAUD,
+    timeout: Annotated[
+        float, Parameter(name=["-t", "--timeout"], help="Timeout in secondi")
+    ] = 1.0,
+) -> None:
+    """Interroga il sensore di temperatura interno dell'STM32 (ADC1_IN16) e VREFINT (ADC1_IN17)."""
+    print(f"[{get_timestamp()}] Richiesta lettura ADC1_IN16 su {port} ({baud} baud)...")
+    try:
+        with serial.Serial(port, baud, timeout=timeout) as ser:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            ser.write(b"T")
+            ser.flush()
+            line = ser.readline().decode("ascii", errors="replace").strip()
+            if not line:
+                print("[-] Nessuna risposta ricevuta entro il timeout.")
+                print(
+                    "[*] NOTA: Assicurarsi che lo Smart Bridge aggiornato sia stato caricato su STM32."
+                )
+                sys.exit(1)
+
+            # Formato atteso: T:XXXX,V:YYYY
+            if not (line.startswith("T:") and ",V:" in line):
+                print(f"[!] Risposta non conforme o byte bridge: {line!r}")
+                sys.exit(1)
+
+            parts = line.split(",")
+            hex_temp = parts[0].split(":")[1]
+            hex_vref = parts[1].split(":")[1]
+
+            raw_temp = int(hex_temp, 16)
+            raw_vref = int(hex_vref, 16)
+
+            # Calcolo VDD reale tramite canale 17 VREFINT (1.20V nominale STM32F103)
+            vdd = (1.20 * 4096.0 / raw_vref) if raw_vref > 0 else 3.30
+
+            # Tensione rilevata su sensore di temperatura
+            vsense = (raw_temp / 4096.0) * vdd
+
+            # Formula Reference Manual ST RM0008 §11.10:
+            # Temperature (°C) = ((V25 - VSENSE) / Avg_Slope) + 25
+            # V25 tipico = 1.43V, Avg_Slope tipico = 4.3 mV/°C (0.0043 V/°C)
+            temp_c = ((1.43 - vsense) / 0.0043) + 25.0
+
+            print("\n" + "=" * 56)
+            print("  🌡️  LETTURA SENSORE TEMPERATURA STM32 (ADC1_IN16)")
+            print("=" * 56)
+            print(f"  • Raw ADC16 (Temp)       : {raw_temp:5d}  (0x{hex_temp})")
+            print(f"  • Raw ADC17 (Vrefint)    : {raw_vref:5d}  (0x{hex_vref})")
+            print(f"  • Tensione VDD Misurata  : {vdd:.3f} V")
+            print(f"  • Tensione VSENSE        : {vsense:.3f} V")
+            print(f"  • Temperatura Core MCU   : {temp_c:+.1f} °C")
+            print("=" * 56 + "\n")
+    except (serial.SerialException, OSError) as exc:
+        print(f"[-] Errore apertura porta seriale {port}: {exc}")
+        sys.exit(2)
+
+
 @app.command
 def listen(
     port: Annotated[

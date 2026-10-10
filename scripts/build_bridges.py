@@ -21,7 +21,7 @@ app = App(
     help="Compilatore bare-metal assembler per bridge UART STM32 (Keystone + Capstone)",
 )
 
-# 1. Smart Bridge (Diagnostic ping '?' -> 'OK\n', pure passthrough for other bytes, auto ORE recovery)
+# 1. Smart Bridge (Diagnostic ping '?' -> 'OK\n', Temp read 'T' -> 'T:<hex>,V:<hex>\n', Bootloader 'B', auto ORE recovery)
 SMART_BRIDGE_ASM = """
 .thumb
 .syntax unified
@@ -30,9 +30,9 @@ SMART_BRIDGE_ASM = """
 .word 0x08000009      // Reset Handler
 
 reset_handler:
-    // RCC clocks
+    // RCC clocks: IOPAEN(2) | IOPBEN(3) | ADC1EN(9) | USART1EN(14) = 0x420C
     ldr r0, =0x40021018   // APB2ENR
-    ldr r1, =0x400C       // IOPAEN | IOPBEN | USART1EN
+    ldr r1, =0x420C
     ldr r2, [r0]
     orrs r2, r2, r1
     str r2, [r0]
@@ -75,16 +75,59 @@ reset_handler:
     ldr r1, =0x200C
     str r1, [r5, #0x0C]
 
+    // ADC1 Setup (Base = 0x40012400)
+    ldr r6, =0x40012400
+
+    // SMPR1: Sample time Ch16 & Ch17 = 239.5 cycles (0x00FC0000)
+    ldr r1, =0x00FC0000
+    str r1, [r6, #0x0C]
+
+    // CR2: Enable ADC1 + Temp Sensor (TSVREFE | ADON = 0x00800001)
+    ldr r1, =0x00800001
+    str r1, [r6, #0x08]
+
+    // Stabilization delay (~2000 cycles)
+    movs r2, #2000
+delay_stab:
+    subs r2, r2, #1
+    bne delay_stab
+
+    // Reset calibration (TSVREFE | RSTCAL | ADON = 0x00800009)
+    ldr r1, =0x00800009
+    str r1, [r6, #0x08]
+wait_rstcal:
+    ldr r2, [r6, #0x08]
+    movs r3, #0x08
+    tst r2, r3
+    bne wait_rstcal
+
+    // Start calibration (TSVREFE | CAL | ADON = 0x00800005)
+    ldr r1, =0x00800005
+    str r1, [r6, #0x08]
+wait_cal:
+    ldr r2, [r6, #0x08]
+    movs r3, #0x04
+    tst r2, r3
+    bne wait_cal
+
 loop:
     // --- Check USART1 (from PC) ---
-    ldr r0, [r4, #0x00]
+    ldr r0, [r4, #0x00]      // USART1->SR
     movs r2, #0x20           // RXNE
     tst r0, r2
     beq check_u1_err
     ldr r1, [r4, #0x04]      // USART1->DR
 
-    cmp r1, #0x3F           // '?'
+    cmp r1, #0x3F           // '?' (Ping)
     beq send_pong
+
+    cmp r1, #0x54           // 'T' (Temperature)
+    beq send_temp
+    cmp r1, #0x74           // 't'
+    beq send_temp
+
+    cmp r1, #0x42           // 'B' (Bootloader jump)
+    beq jump_bootloader
 
 wait_u3_tx:
     ldr r0, [r5, #0x00]
@@ -99,9 +142,26 @@ send_pong:
     bl send_u1_byte
     movs r1, #0x4B           // 'K'
     bl send_u1_byte
-    movs r1, #0x0A           // '\\n'
+    movs r1, #0x0A           // newline
     bl send_u1_byte
     b check_u3
+
+send_temp:
+    bl sample_and_send_temp
+    b check_u3
+
+jump_bootloader:
+    // Reset USART1 and ADC1
+    ldr r0, =0x4002100C      // RCC->APB2RSTR
+    ldr r1, =0x00004200
+    str r1, [r0]
+    movs r1, #0
+    str r1, [r0]
+    // Jump to ST System Memory
+    ldr r0, =0x1FFFF000
+    ldr sp, [r0]
+    ldr r1, [r0, #4]
+    bx r1
 
 check_u1_err:
     movs r2, #0x0F           // ORE | NE | FE | PE
@@ -120,11 +180,93 @@ check_u3:
     b loop
 
 check_u3_err:
-    movs r2, #0x0F           // ORE | NE | FE | PE
+    movs r2, #0x0F
     tst r0, r2
     beq loop
     ldr r1, [r5, #0x04]      // dummy read DR to clear errors
     b loop
+
+sample_and_send_temp:
+    push {lr}
+
+    // 1. Read Channel 16 (Temperature)
+    movs r1, #16
+    str r1, [r6, #0x34]      // SQR3 = 16
+    ldr r1, =0x00DE0001      // TSVREFE | SWSTART | EXTTRIG | EXTSEL=111 | ADON
+    str r1, [r6, #0x08]
+
+wait_eoc16:
+    ldr r0, [r6, #0x00]      // SR
+    movs r2, #0x02           // EOC
+    tst r0, r2
+    beq wait_eoc16
+
+    ldr r1, [r6, #0x4C]      // DR (ADC16 raw)
+    push {r1}
+
+    // Send 'T', ':'
+    movs r1, #0x54           // 'T'
+    bl send_u1_byte
+    movs r1, #0x3A           // ':'
+    bl send_u1_byte
+
+    pop {r1}
+    bl send_hex16
+
+    // 2. Read Channel 17 (Vrefint)
+    movs r1, #17
+    str r1, [r6, #0x34]      // SQR3 = 17
+    ldr r1, =0x00DE0001
+    str r1, [r6, #0x08]
+
+wait_eoc17:
+    ldr r0, [r6, #0x00]
+    movs r2, #0x02
+    tst r0, r2
+    beq wait_eoc17
+
+    ldr r1, [r6, #0x4C]      // DR (ADC17 raw)
+    push {r1}
+
+    // Send ',', 'V', ':'
+    movs r1, #0x2C           // ','
+    bl send_u1_byte
+    movs r1, #0x56           // 'V'
+    bl send_u1_byte
+    movs r1, #0x3A           // ':'
+    bl send_u1_byte
+
+    pop {r1}
+    bl send_hex16
+
+    // Newline
+    movs r1, #0x0A
+    bl send_u1_byte
+
+    pop {pc}
+
+send_hex16:
+    push {r3, lr}
+    mov r3, r1
+    lsrs r1, r3, #12
+    bl send_hex_nibble
+    lsrs r1, r3, #8
+    bl send_hex_nibble
+    lsrs r1, r3, #4
+    bl send_hex_nibble
+    mov r1, r3
+    bl send_hex_nibble
+    pop {r3, pc}
+
+send_hex_nibble:
+    ands r1, r1, #0x0F
+    cmp r1, #10
+    blt hex_digit
+    adds r1, r1, #(0x41 - 10)  // 'A' - 10
+    b send_u1_byte
+hex_digit:
+    adds r1, r1, #0x30         // '0'
+    b send_u1_byte
 
 send_u1_byte:
 wait_u1_tx:
