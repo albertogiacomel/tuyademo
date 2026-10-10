@@ -343,6 +343,9 @@ def flash_pio(
     port: Annotated[
         str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
     ] = DEFAULT_PORT,
+    attempts: Annotated[
+        int, Parameter(name=["-a", "--attempts"], help="Finestra tentativi (secondi)")
+    ] = 30,
 ) -> None:
     """Carica il firmware C++ PlatformIO (stm32_pio_smart_bridge.bin) su STM32 via stm32loader."""
     bin_file = FIRMWARE_DIR / "stm32_pio_smart_bridge.bin"
@@ -365,11 +368,39 @@ def flash_pio(
         str(bin_file),
     ]
     print(
-        f"[{get_timestamp()}] Flashing PlatformIO C++ firmware su STM32: {' '.join(cmd)}"
+        f"[{get_timestamp()}] Flashing PlatformIO C++ firmware su STM32 ({attempts}s finestra)..."
     )
-    res = subprocess.run(cmd, check=False)
-    if res.returncode != 0:
-        sys.exit(res.returncode)
+    print(
+        "  [👉 Tenere premuto S2: MCU BOOT e cliccare S1: MCU RST mentre stm32loader tenta la connessione]"
+    )
+
+    t0 = time.time()
+    success = False
+    while time.time() - t0 < attempts:
+        res = subprocess.run(cmd, check=False)
+        if res.returncode == 0:
+            success = True
+            break
+        time.sleep(0.5)
+
+    if not success:
+        print("[-] Timeout connessione bootloader STM32.")
+        sys.exit(1)
+
+    print(f"[{get_timestamp()}] Flashing completato! Avvio applicazione in Flash...")
+    # Auto-boot application via Go command
+    boot_cmd = [
+        sys.executable,
+        "-m",
+        "stm32loader",
+        "-p",
+        port,
+        "-f",
+        "F1",
+        "-g",
+        "0x08000000",
+    ]
+    subprocess.run(boot_cmd, check=False)
 
 
 @app.command(name="restore-factory")
