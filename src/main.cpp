@@ -488,40 +488,30 @@ void setup() {
     Serial.setTx(PIN_UART1_TX);
     Serial.begin(115200);
 
-    // Initialize Serial3 (TYWE1S module @ 115200 BAUD)
+    // Initialize Serial3 (TYWE1S Tuya module @ 9600 BAUD)
     Serial3.setRx(PIN_UART3_RX);
     Serial3.setTx(PIN_UART3_TX);
-    Serial3.begin(115200);
+    Serial3.begin(9600);
 
     // Initial temperature measurement
     int rt, rv; float vdd;
     current_temp_c = measure_temperature(rt, rv, vdd);
     update_temp_color(current_temp_c);
+
+    // Initial Tuya query
+    tuya_query_wifi_state();
 }
 
 void loop() {
     uint32_t now = millis();
 
-    // --- 1. Forward from TYWE1S (Serial3 @ 115200) to PC (Serial) & Track WiFi state ---
-    static String s3_line = "";
-    while (Serial3.available()) {
-        int sc = Serial3.read();
-        Serial.write((uint8_t)sc);
-        if (sc == '\n') {
-            s3_line.trim();
-            if (s3_line.indexOf("WIFI:CONNECTED") >= 0) {
-                wifi_connected = true;
-                set_led_ctrl(3, 1, 500); // Solid ON
-                set_led_ctrl(1, 1, 500);
-            } else if (s3_line.indexOf("WIFI:DISCONNECTED") >= 0) {
-                wifi_connected = false;
-                set_led_ctrl(3, 2, 500); // Blink 0.5s
-                set_led_ctrl(1, 2, 500);
-            }
-            s3_line = "";
-        } else if (sc != '\r') {
-            if (s3_line.length() < 96) s3_line += (char)sc;
-        }
+    // --- 1. Process Tuya MCU Protocol from TYWE1S (Serial3 @ 9600 baud) ---
+    process_tuya_serial();
+
+    // Periodic Tuya Heartbeat every 5s to keep link active
+    if (now - last_tuya_heartbeat_sent >= 5000) {
+        last_tuya_heartbeat_sent = now;
+        tuya_send_frame(0x00, nullptr, 0);
     }
 
     // --- 2. Process Commands from PC USB (Serial @ 115200 baud) ---
