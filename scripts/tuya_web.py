@@ -13,11 +13,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-import sys
 from typing import Any
 
 import serial
@@ -1725,29 +1725,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Disconnect / Reset LAN Wi-Fi Card -->
-      <div class="card" style="border: 1px solid rgba(239, 68, 68, 0.3); background: rgba(239, 68, 68, 0.05);">
-        <div class="card-title" style="color: var(--red);">
-          <span>🔌 Disconnetti Wi-Fi dalla Rete LAN</span>
-          <span style="font-size: 0.72rem; color: var(--yellow); text-transform: none; font-weight: 700;">SoftAP Pairing</span>
+      <!-- Accesso Dashboard da Rete Locale (LAN & Smartphone) -->
+      <div class="card" style="border: 1px solid rgba(56, 189, 248, 0.3); background: rgba(56, 189, 248, 0.05);">
+        <div class="card-title" style="color: var(--accent);">
+          <span>🌐 Accesso Dashboard da Smartphone (Stessa Rete Wi-Fi)</span>
         </div>
-        <div style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4;">
-          Premendo questo pulsante, la scheda Tuya si disconnette dalla rete Wi-Fi di casa (LAN). Il modulo <b>TYWE1S</b> riattiva immediatamente l'Access Point <b>Tuya-TYDE3-AP</b> e il captive portal (192.168.4.1), tornando visibile per il pairing da cellulare. LED 3 tornerà a lampeggiare con frequenza 0.5s.
-        </div>
-        <button id="btnDisconnectWifi" onclick="disconnectWifiLan()" style="background: rgba(239, 68, 68, 0.18); border: 1px solid var(--red); color: var(--red); padding: 13px; border-radius: 12px; font-weight: 700; font-size: 0.85rem; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; transition: all 0.2s;">
-          📱 Disconnetti dalla LAN & Rendi Visibile per Cellulare
-        </button>
-        <div id="disconnectMsg" style="display: none; font-size: 0.8rem; padding: 10px; border-radius: 8px; text-align: center; font-weight: 600;"></div>
-      </div>
-
-      <!-- Autonomous Captive Portal & Smartphone Experience Info -->
-      <div class="card">
-        <div class="card-title">📱 Esperienza Utente Punto-a-Punto da Smartphone</div>
         <div style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.5; display: flex; flex-direction: column; gap: 8px;">
-          <div><b>1. Connessione Diretta:</b> Dal cellulare, connettiti alla rete Wi-Fi <b>Tuya-TYDE3-AP</b> (password: <code style="color: var(--accent);">tuya123456</code>).</div>
-          <div><b>2. Captive Portal Automatico:</b> Lo smartphone apre direttamente la pagina di benvenuto su <code style="color: var(--accent);">http://192.168.4.1/</code> senza digitare nulla.</div>
-          <div><b>3. Salvataggio in Flash:</b> Quando selezioni la rete di casa (es. <i>Vodafone-30456263</i>), le credenziali vengono salvate permanentemente nella memoria non-volatile EEPROM del TYWE1S.</div>
-          <div><b>4. Passaggio alla Rete LAN:</b> Il Tuya si connette al router di casa, LED 3 diventa fisso ed è accessibile via browser da qualsiasi dispositivo su <code style="color: var(--accent);">http://tuya.local/</code>.</div>
+          <div>Questa pagina web è servita in tempo reale dal PC ed è accessibile da qualsiasi smartphone, tablet o PC collegato al Wi-Fi di casa (<b>Vodafone-30456263</b>):</div>
+          <div style="background: rgba(0,0,0,0.3); padding: 10px 14px; border-radius: 8px; border: 1px solid var(--card-border); font-family: ui-monospace, monospace; font-size: 0.9rem; color: var(--accent); font-weight: 700;">
+            http://192.168.1.215:8090/
+          </div>
+          <div style="font-size: 0.76rem; color: var(--text-muted);">
+            ℹ️ <b>Architettura Duale:</b> Il modulo radio <b>TYWE1S</b> comunica con i server Tuya e l'app mobile <b>Smart Life</b>. Il microcontrollore <b>STM32</b> gestisce i sensori, il LED RGB e la porta seriale USB collegata a questo server web.
+          </div>
         </div>
       </div>
 
@@ -2320,6 +2310,10 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
         return;
       }
 
+      if (!confirm(`Inviare la configurazione per la rete "${ssid}"? Questo metterà il modulo TYWE1S in modalità pairing.`)) {
+        return;
+      }
+
       btn.disabled = true;
       btn.innerText = 'Invio al modulo Tuya in corso...';
       try {
@@ -2400,6 +2394,9 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
     }
 
     async function startPairing(mode) {
+      if (!confirm(`Attenzione: avviare il pairing ${mode} cancellerà le credenziali Wi-Fi salvate nel modulo Tuya TYWE1S e richiederà di riconfigurarlo tramite l'app Smart Life. Continuare?`)) {
+        return;
+      }
       const isAp = mode === 'AP';
       const endpoint = isAp ? '/api/wifi/pair/ap' : '/api/wifi/pair/ez';
       const msgBox = document.getElementById('wifiMsg');
