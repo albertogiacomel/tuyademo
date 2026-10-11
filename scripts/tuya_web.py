@@ -17,6 +17,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+import sys
 from typing import Any
 
 import serial
@@ -2432,6 +2433,9 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
 """
 
 if __name__ == "__main__":
+    web_port = 8090
+    if len(sys.argv) > 1 and sys.argv[1].isdigit():
+        web_port = int(sys.argv[1])
     b = BoardBridge("COM3", 115200)
     server = create_app(b)
-    server.run(host="0.0.0.0", port=8080, debug=False)
+    server.run(host="0.0.0.0", port=web_port, debug=False)
