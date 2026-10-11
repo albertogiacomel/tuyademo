@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from datetime import UTC, datetime
@@ -20,6 +21,12 @@ from typing import Any
 
 import serial
 from flask import Flask, Response, jsonify, request
+
+try:  # Integrazione EMQX opzionale e fail-soft (R10: credenziali mai su file)
+    from emqx_bridge import EmqxBridge, make_command_handler
+except ImportError:  # paho-mqtt assente o modulo non disponibile
+    EmqxBridge = None  # type: ignore[assignment]
+    make_command_handler = None  # type: ignore[assignment]
 
 CONFIG_FILE = Path(__file__).resolve().parent.parent / "config" / "wifi_config.json"
 
@@ -41,6 +48,7 @@ class BoardBridge:
             "online": False,
             "port": port,
             "baud": baud,
+            "last_error": None,
             "temp_c": 25.0,
             "vdd": 3.3,
             "raw_temp": 0,
@@ -54,6 +62,8 @@ class BoardBridge:
             "last_seen": None,
             "wifi_connected": False,
             "wifi_ssid": "Vodafone-30456263",
+            "wifi_ip": None,
+            "wifi_rssi": None,
             "leds": {
                 "1": {
                     "id": 1,
@@ -99,6 +109,11 @@ class BoardBridge:
                 logger.debug("Close serial ignored error: %s", exc)
         self._ser = None
 
+    def close(self) -> None:
+        """Closes the underlying serial connection cleanly."""
+        with self.lock:
+            self._close_serial()
+
     def ping(self) -> bool:
         with self.lock:
             t0 = time.time()
@@ -113,6 +128,7 @@ class BoardBridge:
                     self.status["online"] = True
                     self.status["latency_ms"] = latency
                     self.status["last_seen"] = datetime.now(UTC).isoformat()
+                    self.status["last_error"] = None
                     return True
                 self.status["online"] = False
                 return False
@@ -120,6 +136,7 @@ class BoardBridge:
                 logger.warning("Ping error on %s: %s", self.port, exc)
                 self._close_serial()
                 self.status["online"] = False
+                self.status["last_error"] = str(exc)
                 return False
 
     def read_temp(self) -> dict[str, Any]:
@@ -154,6 +171,7 @@ class BoardBridge:
                     self.status["raw_temp"] = raw_temp
                     self.status["raw_vref"] = raw_vref
                     self.status["last_seen"] = datetime.now(UTC).isoformat()
+                    self.status["last_error"] = None
                     return {
                         "ok": True,
                         "temp_c": self.status["temp_c"],
@@ -167,6 +185,7 @@ class BoardBridge:
                 logger.warning("Read temp error: %s", exc)
                 self._close_serial()
                 self.status["online"] = False
+                self.status["last_error"] = str(exc)
                 return {"ok": False, "error": str(exc)}
 
     def send_cmd(self, cmd_str: str) -> str:
@@ -190,13 +209,16 @@ class BoardBridge:
                         for k in ("OK", "ERR", "RGB:", "LED:", "WIFI:", "CONFIG")
                     ):
                         break
+                self.parse_wifi_frame(resp)
                 self.status["online"] = True
                 self.status["last_seen"] = datetime.now(UTC).isoformat()
+                self.status["last_error"] = None
                 return resp
             except (serial.SerialException, OSError) as exc:
                 logger.warning("Send cmd error '%s': %s", cmd_str.strip(), exc)
                 self._close_serial()
                 self.status["online"] = False
+                self.status["last_error"] = str(exc)
                 return f"ERR:{exc}"
 
     def set_rgb(self, r: int, g: int, b: int) -> bool:
@@ -270,6 +292,85 @@ class BoardBridge:
             except (ValueError, IndexError) as exc:
                 logger.debug("Failed parsing LED query response: %s", exc)
         return self.status["leds"]
+
+    _WIFI_FRAME_RE = re.compile(
+        r"WIFI:(?P<state>CONFIG_SENT|OK:CONNECTED|OK:DISCONNECTED|OK:PAIRING_AP|OK:PAIRING_EZ|CONNECTED|DISCONNECTED)"
+        r"(?:,STATE:(?P<tuya_state>\d+))?"
+        r"(?:,LED3:(?P<led3>[A-Z0-9_]+))?"
+        r"(?:,IP:(?P<ip>\d{1,3}(?:\.\d{1,3}){3}))?"
+        r"(?:,SSID:(?P<ssid>[^,\r\n]*))?"
+        r"(?:,RSSI:(?P<rssi>-?\d+))?"
+    )
+
+    def parse_wifi_frame(self, line: str) -> bool:
+        """Aggiorna wifi_connected/wifi_ip/wifi_ssid/wifi_rssi da un frame WIFI:."""
+        match = self._WIFI_FRAME_RE.search(line or "")
+        if not match or match.group("state") == "CONFIG_SENT":
+            return False
+        connected = match.group("state") in ("CONNECTED", "OK:CONNECTED")
+        self.status["wifi_connected"] = connected
+        if "3" in self.status["leds"]:
+            self.status["leds"]["3"]["mode"] = "ON" if connected else "BLINK"
+            self.status["leds"]["3"]["period_ms"] = 500
+        self.status["wifi_ip"] = match.group("ip") if connected else None
+        if match.group("ssid"):
+            self.status["wifi_ssid"] = match.group("ssid").strip()
+        rssi = match.group("rssi")
+        self.status["wifi_rssi"] = int(rssi) if rssi else None
+        return True
+
+    def start_pairing_ap(self) -> bool:
+        resp = self.send_cmd("W:PAIR:AP")
+        self.status["wifi_connected"] = False
+        if "3" in self.status["leds"]:
+            self.status["leds"]["3"]["mode"] = "BLINK"
+            self.status["leds"]["3"]["period_ms"] = 500
+        return "OK" in resp or "RESET" in resp or "MODE" in resp or "PAIRING" in resp
+
+    def start_pairing_ez(self) -> bool:
+        resp = self.send_cmd("W:PAIR:EZ")
+        self.status["wifi_connected"] = False
+        if "3" in self.status["leds"]:
+            self.status["leds"]["3"]["mode"] = "BLINK"
+            self.status["leds"]["3"]["period_ms"] = 250
+        return "OK" in resp or "RESET" in resp or "MODE" in resp or "PAIRING" in resp
+
+    def query_wifi(self) -> str:
+        """Interroga il TYWE1S (W:?) e aggiorna stato Wi-Fi + IP LAN corrente."""
+        with self.lock:
+            t_start = time.time()
+            try:
+                ser = self._get_serial()
+                ser.reset_input_buffer()
+                ser.write(b"W:?\n")
+                ser.flush()
+                lines: list[str] = []
+                while time.time() - t_start < 0.6:
+                    cand = ser.readline().decode("ascii", errors="replace").strip()
+                    if not cand:
+                        continue
+                    lines.append(cand)
+                    if (
+                        cand.startswith("WIFI:")
+                        and ("CONNECTED" in cand or "DISCONNECTED" in cand)
+                    ) or "ERR" in cand:
+                        break
+            except (serial.SerialException, OSError) as exc:
+                logger.warning("Query wifi error: %s", exc)
+                self._close_serial()
+                self.status["online"] = False
+                self.status["last_error"] = str(exc)
+                return f"ERR:{exc}"
+
+        best = ""
+        for line in lines:
+            if self.parse_wifi_frame(line):
+                best = line
+        if lines:
+            self.status["online"] = True
+            self.status["last_seen"] = datetime.now(UTC).isoformat()
+            self.status["last_error"] = None
+        return best or (lines[0] if lines else "")
 
     def disconnect_wifi(self) -> bool:
         resp = self.send_cmd("W:DISCONNECT")
@@ -389,12 +490,27 @@ class BoardBridge:
             return networks
 
 
+def create_emqx_bridge(bridge: BoardBridge) -> object | None:
+    """Avvia il bridge EMQX in modo fail-soft; None se non disponibile."""
+    if EmqxBridge is None or make_command_handler is None:
+        logger.warning("emqx_bridge non importato: integrazione EMQX disattivata")
+        return None
+    emqx = EmqxBridge(
+        status_provider=lambda: bridge.status,
+        command_handler=make_command_handler(bridge),
+    )
+    if not emqx.start():
+        logger.warning("EMQX non attivo: %s", emqx.last_error)
+    return emqx
+
+
 def create_app(bridge: BoardBridge) -> Flask:
     app = Flask(__name__)
 
     # Pre-warm bridge on startup
     bridge.ping()
     bridge.read_temp()
+    emqx = create_emqx_bridge(bridge)
 
     @app.route("/api/ping", methods=["GET"])
     def api_ping():
@@ -412,7 +528,39 @@ def create_app(bridge: BoardBridge) -> Flask:
     def api_status():
         bridge.read_temp()
         bridge.query_leds()
-        return jsonify(bridge.status)
+        status = dict(bridge.status)
+        status["emqx"] = (
+            emqx.status()
+            if emqx is not None
+            else {
+                "enabled": False,
+                "connected": False,
+                "last_error": "non inizializzato",
+            }
+        )
+        return jsonify(status)
+
+    @app.route("/api/emqx/status", methods=["GET"])
+    def api_emqx_status():
+        if emqx is None:
+            return jsonify(
+                {
+                    "enabled": False,
+                    "connected": False,
+                    "last_error": "non inizializzato",
+                }
+            )
+        return jsonify(emqx.status())
+
+    @app.route("/api/emqx/test", methods=["POST"])
+    def api_emqx_test():
+        if emqx is None:
+            return (
+                jsonify({"ok": False, "error": "bridge EMQX non inizializzato"}),
+                503,
+            )
+        ok = emqx.publish_telemetry()
+        return jsonify({"ok": ok, "payload": emqx.last_payload, "stats": emqx.status()})
 
     @app.route("/api/leds", methods=["GET"])
     def api_leds():
@@ -507,6 +655,8 @@ def create_app(bridge: BoardBridge) -> Flask:
                 "ok": True,
                 "connected": bridge.status["wifi_connected"],
                 "ssid": bridge.status.get("wifi_ssid"),
+                "ip": bridge.status.get("wifi_ip"),
+                "rssi": bridge.status.get("wifi_rssi"),
                 "led3": (
                     "SOLID_ON" if bridge.status["wifi_connected"] else "BLINK_0_5S"
                 ),
@@ -515,15 +665,47 @@ def create_app(bridge: BoardBridge) -> Flask:
 
     @app.route("/api/wifi/disconnect", methods=["POST"])
     def api_wifi_disconnect():
-        ok = bridge.disconnect_wifi()
+        ok = bridge.start_pairing_ap()
         return jsonify(
             {
                 "ok": ok,
                 "connected": False,
                 "led3": "BLINK_0_5S",
                 "message": (
-                    "Disconnesso dalla rete LAN. Wi-Fi SoftAP Tuya-TYDE3-AP"
-                    " attivo per pairing da cellulare. LED 3 lampeggia a 0.5s."
+                    "Disconnesso dalla rete LAN. Modulo TYWE1S in pairing AP (SmartLife-xxxx). "
+                    "LED 3 lampeggia a 0.5s. Ricollegati dall'app o dal cellulare."
+                ),
+            }
+        )
+
+    @app.route("/api/wifi/pair/ap", methods=["POST"])
+    def api_wifi_pair_ap():
+        ok = bridge.start_pairing_ap()
+        return jsonify(
+            {
+                "ok": ok,
+                "mode": "AP",
+                "connected": False,
+                "led3": "BLINK_0_5S",
+                "message": (
+                    "Modalità pairing AP avviata sul TYWE1S! Hotspot SmartLife-xxxx attivo. "
+                    "LED 3 lampeggia a 0.5s."
+                ),
+            }
+        )
+
+    @app.route("/api/wifi/pair/ez", methods=["POST"])
+    def api_wifi_pair_ez():
+        ok = bridge.start_pairing_ez()
+        return jsonify(
+            {
+                "ok": ok,
+                "mode": "EZ",
+                "connected": False,
+                "led3": "BLINK_0_25S",
+                "message": (
+                    "Modalità pairing EZ (SmartConfig) avviata sul TYWE1S! "
+                    "Apri l'app Tuya Smart per la ricerca automatica. LED 3 lampeggia rapido."
                 ),
             }
         )
@@ -620,7 +802,11 @@ def create_app(bridge: BoardBridge) -> Flask:
 
     @app.route("/", methods=["GET"])
     def index():
-        return Response(DASHBOARD_HTML, mimetype="text/html; charset=utf-8")
+        resp = Response(DASHBOARD_HTML, mimetype="text/html; charset=utf-8")
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
 
     return app
 
@@ -730,6 +916,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       background: rgba(239, 68, 68, 0.15);
       border-color: rgba(239, 68, 68, 0.3);
       color: var(--red);
+    }
+
+    .status-badge.usb-badge {
+      background: rgba(56, 189, 248, 0.15);
+      border-color: rgba(56, 189, 248, 0.35);
+      color: var(--accent);
+    }
+
+    .status-badge.usb-badge.offline {
+      background: rgba(239, 68, 68, 0.15);
+      border-color: rgba(239, 68, 68, 0.35);
+      color: var(--red);
+    }
+
+    .toast-popup {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(15, 23, 42, 0.95);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      padding: 10px 20px;
+      border-radius: 24px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.6);
+      z-index: 9999;
+      transition: opacity 0.3s ease;
+      pointer-events: none;
     }
 
     .status-dot {
@@ -1182,9 +1402,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="subtitle">STM32F103 + TYWE1S Wi-Fi Bridge</div>
         </div>
       </div>
-      <div id="statusBadge" class="status-badge">
-        <span class="status-dot"></span>
-        <span id="statusText">ONLINE</span>
+      <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end;">
+        <div id="usbBadge" class="status-badge usb-badge">
+          <span style="font-size: 0.85rem;">🔌</span>
+          <span id="usbText">USB COM3 (ATTIVO)</span>
+        </div>
+        <div id="statusBadge" class="status-badge">
+          <span class="status-dot"></span>
+          <span id="statusText">ONLINE</span>
+        </div>
       </div>
     </header>
 
@@ -1405,6 +1631,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           Scansiona le reti 2.4 GHz visibili al modulo <b>TYWE1S (ESP8266)</b>, seleziona il tuo SSID dall'elenco e invia password e credenziali alla scheda per il salvataggio permanente in memoria Flash.
         </div>
 
+        <!-- Indirizzo IP LAN del modulo (frame WIFI:CONNECTED,IP:... via seriale) -->
+        <div style="display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.25); border: 1px solid var(--card-border); border-radius: 10px; padding: 10px 14px;">
+          <span style="font-size: 0.78rem; color: var(--text-muted); font-weight: 600;">Indirizzo IP sulla LAN</span>
+          <span id="wifiIp" style="font-size: 0.85rem; font-weight: 800; color: var(--yellow); font-family: ui-monospace, SFMono-Regular, Consolas, monospace;">--</span>
+        </div>
+
         <!-- Scan Button -->
         <button id="btnScanWifi" onclick="scanWifiNetworks()" style="background: rgba(56, 189, 248, 0.12); border: 1px solid var(--accent); color: var(--accent); padding: 12px 14px; border-radius: 10px; font-size: 0.85rem; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; transition: all 0.2s;">
           🔍 Cerca Reti Wi-Fi Visibili al Tuya
@@ -1426,6 +1658,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <button type="button" onclick="selectSsid('Vodafone-30456263')" style="background: rgba(56, 189, 248, 0.15); border: 1px solid var(--accent); color: var(--accent); padding: 6px 12px; border-radius: 8px; font-size: 0.8rem; font-weight: 700; cursor: pointer; display: flex; align-items: center; gap: 6px; transition: all 0.2s;">
             📶 Vodafone-30456263
           </button>
+        </div>
+
+        <!-- Pairing Triggers (Tuya Native Factory Protocol) -->
+        <div style="background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div style="font-size: 0.8rem; font-weight: 700; color: var(--accent);">📡 Avvia Associazione Wi-Fi (Tuya Native)</div>
+            <span style="font-size: 0.7rem; color: var(--text-muted);">TYWE1S 9600 baud</span>
+          </div>
+          <div style="font-size: 0.74rem; color: var(--text-muted); line-height: 1.35;">
+            LED 3 lampeggia durante la ricerca e diventa <b>fisso</b> non appena il modulo è connesso alla rete Wi-Fi.
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+            <button type="button" onclick="startPairing('AP')" style="padding: 10px; background: rgba(56, 189, 248, 0.18); border: 1px solid var(--accent); color: var(--accent); border-radius: 8px; font-size: 0.78rem; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px;">
+              📱 Pairing AP (Hotspot)
+            </button>
+            <button type="button" onclick="startPairing('EZ')" style="padding: 10px; background: rgba(168, 85, 247, 0.18); border: 1px solid var(--purple); color: var(--purple); border-radius: 8px; font-size: 0.78rem; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px;">
+              ⚡ Pairing EZ (Tuya App)
+            </button>
+          </div>
         </div>
 
         <!-- Manual Wi-Fi State Override -->
@@ -1490,6 +1741,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- EMQX Cloud Bridge Card -->
+      <div class="card">
+        <div class="card-title">
+          <span>☁️ EMQX Cloud Bridge (MQTT/TLS)</span>
+          <span id="emqxBadge" style="font-size: 0.75rem; text-transform: none; color: var(--text-muted);">non attivo</span>
+        </div>
+        <div style="font-size: 0.8rem; color: var(--text-muted); line-height: 1.4;">
+          Pubblica la telemetria su <code style="color: var(--accent);">tuya/tyde3/telemetry</code> e riceve comandi su <code style="color: var(--accent);">tuya/tyde3/command</code> via TLS verso <code style="color: var(--accent);">r202df21.ala.eu-central-1.emqxsl.com:8883</code>. Credenziali dal Windows Credential Manager (target <b>EMQX-MQTT</b>).
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.25); border: 1px solid var(--card-border); border-radius: 10px; padding: 10px 14px;">
+          <span style="font-size: 0.78rem; color: var(--text-muted); font-weight: 600;">Stato bridge</span>
+          <span id="emqxState" style="font-size: 0.8rem; font-weight: 700; color: var(--yellow);">--</span>
+        </div>
+        <button id="btnTestEmqx" onclick="testEmqx()" style="background: rgba(56, 189, 248, 0.12); border: 1px solid var(--accent); color: var(--accent); padding: 12px 14px; border-radius: 10px; font-size: 0.85rem; font-weight: 700; cursor: pointer;">📤 Pubblica Telemetria su EMQX Ora</button>
+      </div>
+
       <!-- REST API Endpoints Quick Reference -->
       <div class="card">
         <div class="card-title">📡 REST API Endpoints</div>
@@ -1517,7 +1784,32 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
     </footer>
   </div>
 
+  <!-- Floating Toast Notification -->
+  <div id="toastNotification" class="toast-popup" style="display: none; opacity: 0;">
+    <span id="toastIcon">✅</span>
+    <span id="toastMsg">Comando inviato via USB</span>
+  </div>
+
   <script>
+    let toastTimeout = null;
+    function showToast(msg, isSuccess = true) {
+      const toast = document.getElementById('toastNotification');
+      const icon = document.getElementById('toastIcon');
+      const text = document.getElementById('toastMsg');
+      if (!toast) return;
+      icon.innerText = isSuccess ? '✅' : '❌';
+      text.innerText = msg;
+      toast.style.borderColor = isSuccess ? 'rgba(34, 197, 94, 0.4)' : 'rgba(239, 68, 68, 0.4)';
+      toast.style.color = isSuccess ? '#22c55e' : '#ef4444';
+      toast.style.display = 'flex';
+      toast.style.opacity = '1';
+      clearTimeout(toastTimeout);
+      toastTimeout = setTimeout(() => {
+        toast.style.opacity = '0';
+        setTimeout(() => { toast.style.display = 'none'; }, 300);
+      }, 2200);
+    }
+
     let currentBrightness = 20;
     let currentMode = 'TEMP';
     let currentR = 0, currentG = 255, currentB = 30;
@@ -1629,12 +1921,17 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
           body: JSON.stringify({led: id, mode: mode, period_ms: period})
         });
         const data = await res.json();
-        if (data.ok && data.leds && data.leds[String(id)]) {
-          const l = data.leds[String(id)];
-          updateLedCard(id, l.mode, l.period_ms);
+        if (data.ok) {
+          showToast(`LED ${id}: ${mode} inviato via USB COM3`, true);
+          if (data.leds && data.leds[String(id)]) {
+            const l = data.leds[String(id)];
+            updateLedCard(id, l.mode, l.period_ms);
+          }
+        } else {
+          showToast(`Errore USB LED ${id}: ${data.error || 'Comando non riuscito'}`, false);
         }
       } catch (err) {
-        console.error('Error setting LED:', err);
+        showToast(`Errore invio LED ${id}: ${err.message}`, false);
       }
     }
 
@@ -1665,14 +1962,25 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
         const data = await res.json();
 
         // Update badge
+        const usbBadge = document.getElementById('usbBadge');
+        const usbText = document.getElementById('usbText');
+
         if (data.online) {
           statusBadge.classList.remove('offline');
           statusText.innerText = 'ONLINE';
           latencyText.innerText = `${data.latency_ms} ms`;
+          if (usbBadge) {
+            usbBadge.classList.remove('offline');
+            usbText.innerText = `USB ${data.port || 'COM3'} (ATTIVO)`;
+          }
         } else {
           statusBadge.classList.add('offline');
           statusText.innerText = 'OFFLINE';
-          latencyText.innerText = 'Disconnesso';
+          latencyText.innerText = data.last_error ? `Err: ${data.last_error.substring(0, 15)}...` : 'Disconnesso';
+          if (usbBadge) {
+            usbBadge.classList.add('offline');
+            usbText.innerText = `USB ${data.port || 'COM3'} (OFFLINE)`;
+          }
         }
 
         // Update temp
@@ -1728,6 +2036,21 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
           }
         }
 
+        // Update Wi-Fi LAN IP
+        const wifiIp = document.getElementById('wifiIp');
+        if (wifiIp) {
+          if (data.wifi_connected && data.wifi_ip) {
+            wifiIp.innerText = data.wifi_ip;
+            wifiIp.style.color = '#22c55e';
+          } else if (data.wifi_connected) {
+            wifiIp.innerText = 'in attesa IP...';
+            wifiIp.style.color = '#eab308';
+          } else {
+            wifiIp.innerText = 'non connesso';
+            wifiIp.style.color = '#eab308';
+          }
+        }
+
         // Update Wi-Fi badge
         const wifiBadge = document.getElementById('wifiBadge');
         if (data.wifi_connected) {
@@ -1741,10 +2064,55 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
             wifiBadge.style.color = '#eab308';
           }
         }
+
+        // Update EMQX Cloud bridge state
+        const emqxBadge = document.getElementById('emqxBadge');
+        const emqxState = document.getElementById('emqxState');
+        if (data.emqx && emqxBadge && emqxState) {
+          if (data.emqx.connected) {
+            emqxBadge.innerText = 'CONNESSO';
+            emqxBadge.style.color = '#22c55e';
+            emqxState.innerText = `online · inviati: ${data.emqx.telemetry_sent ?? 0} · ricevuti: ${data.emqx.commands_received ?? 0}`;
+            emqxState.style.color = '#22c55e';
+          } else if (data.emqx.enabled) {
+            emqxBadge.innerText = 'IN CONNESSIONE';
+            emqxBadge.style.color = '#eab308';
+            emqxState.innerText = 'riconnessione in corso...';
+            emqxState.style.color = '#eab308';
+          } else {
+            emqxBadge.innerText = 'DISATTIVO';
+            emqxBadge.style.color = '#ef4444';
+            emqxState.innerText = data.emqx.last_error ? String(data.emqx.last_error).substring(0, 48) : 'non configurato';
+            emqxState.style.color = '#ef4444';
+          }
+        }
       } catch (err) {
         statusBadge.classList.add('offline');
         statusText.innerText = 'ERRORE';
         latencyText.innerText = 'Offline';
+        const usbBadge = document.getElementById('usbBadge');
+        const usbText = document.getElementById('usbText');
+        if (usbBadge) {
+          usbBadge.classList.add('offline');
+          usbText.innerText = 'USB COM3 (OFFLINE)';
+        }
+      }
+    }
+
+    async function testEmqx() {
+      const btn = document.getElementById('btnTestEmqx');
+      if (btn) btn.disabled = true;
+      try {
+        const res = await fetch('/api/emqx/test', { method: 'POST' });
+        const d = await res.json();
+        showToast(
+          d.ok ? 'Telemetria pubblicata su EMQX Cloud' : `Errore EMQX: ${d.error || 'publish fallita'}`,
+          d.ok
+        );
+      } catch (err) {
+        showToast(`Errore EMQX: ${err.message}`, false);
+      } finally {
+        if (btn) btn.disabled = false;
       }
     }
 
@@ -1770,32 +2138,63 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
 
       clearTimeout(sliderDebounce);
       sliderDebounce = setTimeout(async () => {
-        await fetch('/api/brightness', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({brightness: val})
-        });
+        try {
+          const res = await fetch('/api/brightness', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({brightness: val})
+          });
+          const d = await res.json();
+          if (d.ok) {
+            showToast(`Luminosità ${val}% applicata via USB`, true);
+          } else {
+            showToast(`Errore USB luminosità: ${d.error || 'Fallito'}`, false);
+          }
+        } catch (err) {
+          showToast(`Errore invio luminosità: ${err.message}`, false);
+        }
       }, 50);
     });
 
     // Preset Colors
     async function applyColor(name) {
       setModeButtonActive('MANUAL');
-      await fetch('/api/rgb', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({color: name, brightness: currentBrightness})
-      });
+      try {
+        const res = await fetch('/api/rgb', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({color: name, brightness: currentBrightness})
+        });
+        const d = await res.json();
+        if (d.ok) {
+          showToast(`Colore RGB (${name}) impostato via USB`, true);
+        } else {
+          showToast(`Errore USB: ${d.error || 'Comando non riuscito'}`, false);
+        }
+      } catch (err) {
+        showToast(`Errore invio USB: ${err.message}`, false);
+      }
       fetchStatus();
     }
 
     async function setCustomRgb(r, g, b) {
       setModeButtonActive('MANUAL');
-      await fetch('/api/rgb', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({r: r, g: g, b: b, brightness: currentBrightness})
-      });
+      updateOrb(r, g, b, currentBrightness);
+      try {
+        const res = await fetch('/api/rgb', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({r: r, g: g, b: b, brightness: currentBrightness})
+        });
+        const d = await res.json();
+        if (d.ok) {
+          showToast(`RGB (${r}, ${g}, ${b}) inviato via USB`, true);
+        } else {
+          showToast(`Errore USB: ${d.error || 'Comando non riuscito'}`, false);
+        }
+      } catch (err) {
+        showToast(`Errore invio USB: ${err.message}`, false);
+      }
       fetchStatus();
     }
 
@@ -1811,11 +2210,21 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
     // Mode Toggle
     async function applyMode(mode) {
       setModeButtonActive(mode);
-      await fetch('/api/mode', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({mode: mode})
-      });
+      try {
+        const res = await fetch('/api/mode', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({mode: mode})
+        });
+        const d = await res.json();
+        if (d.ok) {
+          showToast(`Modalità RGB ${mode} impostata via USB`, true);
+        } else {
+          showToast(`Errore USB: ${d.error || 'Comando non riuscito'}`, false);
+        }
+      } catch (err) {
+        showToast(`Errore invio USB: ${err.message}`, false);
+      }
       fetchStatus();
     }
 
@@ -1966,6 +2375,31 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
       } finally {
         btn.disabled = false;
         btn.innerText = '📱 Disconnetti dalla LAN & Rendi Visibile per Cellulare';
+      }
+    }
+
+    async function startPairing(mode) {
+      const isAp = mode === 'AP';
+      const endpoint = isAp ? '/api/wifi/pair/ap' : '/api/wifi/pair/ez';
+      const msgBox = document.getElementById('wifiMsg');
+      try {
+        const res = await fetch(endpoint, { method: 'POST' });
+        const d = await res.json();
+        if (msgBox) {
+          msgBox.style.display = 'block';
+          msgBox.style.background = 'rgba(56, 189, 248, 0.2)';
+          msgBox.style.color = '#38bdf8';
+          msgBox.innerText = '✅ ' + (d.message || `Pairing ${mode} avviato!`);
+        }
+        showToast(`Pairing ${mode} avviato: LED 3 lampeggia!`, true);
+        fetchStatus();
+      } catch (err) {
+        if (msgBox) {
+          msgBox.style.display = 'block';
+          msgBox.style.background = 'rgba(239, 68, 68, 0.2)';
+          msgBox.style.color = '#ef4444';
+          msgBox.innerText = '❌ Errore avvio pairing: ' + err.message;
+        }
       }
     }
 

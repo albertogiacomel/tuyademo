@@ -19,6 +19,7 @@ const char* AP_PASS = "tuya123456";
 ESP8266WebServer server(80);
 
 void handleApiWifiScan();
+void handleApiWifiStatus();
 
 // Cached telemetry state from STM32
 static float cached_temp = 25.0f;
@@ -56,12 +57,39 @@ void pollTemperatureFromStm32() {
     }
 }
 
+// Esporta su seriale lo stato Wi-Fi del modulo, IP LAN incluso.
+// Frame connesso:   WIFI:CONNECTED,IP:192.168.1.x,SSID:<rete>,RSSI:<dbm>
+// Frame disconnesso: WIFI:DISCONNECTED
+String buildWifiStateFrame() {
+    if (WiFi.status() != WL_CONNECTED) {
+        return String("WIFI:DISCONNECTED");
+    }
+    String frame = "WIFI:CONNECTED,IP:" + WiFi.localIP().toString();
+    frame += ",SSID:" + WiFi.SSID();
+    frame += ",RSSI:" + String(WiFi.RSSI());
+    return frame;
+}
+
+// Emette il frame solo su variazione di stato o di IP (nessuno spam seriale).
+void exportWifiState() {
+    static String last_frame = "";
+    String frame = buildWifiStateFrame();
+    if (frame == last_frame) return;
+    last_frame = frame;
+    Serial.println(frame);
+    Serial.flush();
+}
+
 void handleApiStatus() {
     pollTemperatureFromStm32();
     String json = "{";
     json += "\"online\":true,";
     json += "\"temp_c\":" + String(cached_temp, 1) + ",";
     json += "\"vdd\":" + String(cached_vdd, 2) + ",";
+    json += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+    json += "\"wifi_ip\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("")) + "\",";
+    json += "\"wifi_ssid\":\"" + WiFi.SSID() + "\",";
+    json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"brightness\":" + String(cached_brightness) + ",";
     json += "\"mode\":\"" + cached_mode + "\",";
     json += "\"r\":" + String(cached_r) + ",";
@@ -200,6 +228,7 @@ input[type=range]{width:90%;margin:15px 0}
   <h2>💡 Tuya TYDE 3.0 Wi-Fi</h2>
   <div id="orb" class="orb"></div>
   <p>Temp: <b id="t">--.- °C</b> | VDD: <b id="v">-- V</b></p>
+  <p>Rete: <b id="ssid">--</b> | IP LAN: <b id="ip">--</b> | RSSI: <b id="rssi">--</b></p>
   <p>Luminosità: <b id="bv">20%</b></p>
   <input type="range" min="5" max="100" value="20" oninput="setBri(this.value)">
   <div>
@@ -218,6 +247,9 @@ async function poll(){
     document.getElementById('t').innerText=d.temp_c+' °C';
     document.getElementById('v').innerText=d.vdd+' V';
     document.getElementById('bv').innerText=d.brightness+'%';
+    document.getElementById('ssid').innerText=d.wifi_connected?d.wifi_ssid:'non connesso';
+    document.getElementById('ip').innerText=d.wifi_ip?d.wifi_ip:'--';
+    document.getElementById('rssi').innerText=d.wifi_rssi?d.wifi_rssi+' dBm':'--';
     document.getElementById('orb').style.background='rgb('+d.r+','+d.g+','+d.b+')';
   }catch(e){}
 }
@@ -238,6 +270,19 @@ setInterval(poll,2000);poll();
 </body>
 </html>
 )rawliteral";
+
+// GET /api/wifi/status -> {"connected":bool,"ip":"...","ssid":"...","rssi":dbm}
+void handleApiWifiStatus() {
+    bool conn = (WiFi.status() == WL_CONNECTED);
+    String json = "{";
+    json += "\"connected\":" + String(conn ? "true" : "false") + ",";
+    json += "\"ip\":\"" + (conn ? WiFi.localIP().toString() : String("")) + "\",";
+    json += "\"ssid\":\"" + WiFi.SSID() + "\",";
+    json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+    json += "\"mac\":\"" + WiFi.macAddress() + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+}
 
 void handleApiWifiScan() {
     int n = WiFi.scanNetworks(false, true);
@@ -288,6 +333,7 @@ void setup() {
     server.on("/api/brightness", HTTP_POST, handleApiBrightness);
     server.on("/api/mode", HTTP_POST, handleApiMode);
     server.on("/api/wifi/scan", HTTP_GET, handleApiWifiScan);
+    server.on("/api/wifi/status", HTTP_GET, handleApiWifiStatus);
     server.on("/api/wifi/disconnect", HTTP_POST, handleApiWifiDisconnect);
     server.on("/api/led", HTTP_POST, handleApiLed);
 
@@ -297,14 +343,13 @@ void setup() {
 void loop() {
     server.handleClient();
 
+    // Esporta su seriale stato Wi-Fi + IP LAN ad ogni variazione
+    // (prima connessione, cambio IP DHCP, disconnessione).
+    exportWifiState();
+
     // Wi-Fi Status Indicator on LED3:
     // If connected -> Solid ON (LOW). If not connected -> Blink every 0.5s (500ms).
     bool is_conn = (WiFi.status() == WL_CONNECTED);
-    static bool last_conn_state = false;
-    if (is_conn != last_conn_state) {
-        last_conn_state = is_conn;
-        Serial.println(is_conn ? "WIFI:CONNECTED" : "WIFI:DISCONNECTED");
-    }
 
     if (is_conn) {
         for (uint8_t p : LED_PINS) digitalWrite(p, LOW); // Active Low: Solid ON
@@ -322,6 +367,9 @@ void loop() {
             for (int i = 0; i < n; i++) {
                 Serial.printf("SSID:%s,RSSI:%d\n", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
             }
+        } else if (line.equalsIgnoreCase("W:?") || line.equalsIgnoreCase("W:STATUS")) {
+            // Query stato Wi-Fi: risponde con il frame WIFI:CONNECTED,IP:...
+            Serial.println(buildWifiStateFrame());
         } else if (line.equalsIgnoreCase("W:DISCONNECT") || line.equalsIgnoreCase("W:RESET")) {
             WiFi.disconnect();
             WiFi.mode(WIFI_AP_STA);

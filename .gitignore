@@ -4,3 +4,4 @@ __pycache__/
 *.log
 .pio/
 .vscode/
+config/

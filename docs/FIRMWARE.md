@@ -96,6 +96,7 @@ Per garantire la massima affidabilità senza interrompere `esptool`:
 * Se il PC invia il byte ASCII **`?`** (`0x3F`): l'STM32 risponde direttamente `OK\n`. Questo permette al comando `python tuya_cli.py ping` di verificare istantaneamente la salute del runtime STM32.
 * Se il PC invia il byte ASCII **`T`** (`0x54`) o **`t`** (`0x74`): l'STM32 acquisisce il canale **`ADC1_IN16`** (temperatura die) e **`ADC1_IN17`** (tensione di riferimento interna VREFINT) e risponde istantaneamente con la stringa `T:<hex16>,V:<hex16>\n` (gestita dal comando `python tuya_cli.py read-temp`).
 * Se il PC invia il byte ASCII **`B`** (`0x42`): l'STM32 effettua un salto hardware diretto al bootloader ST in System ROM (`0x1FFFF000`).
+* Se il PC invia **`W:?`** o **`W:STATUS`**: il comando viene inoltrato trasparentemente al TYWE1S (senza alterare lo stato del LED 3); il modulo risponde con `WIFI:CONNECTED,IP:<ip>,SSID:<ssid>,RSSI:<dbm>` oppure `WIFI:DISCONNECTED`. Il firmware TYWE1S esporta autonomamente lo stesso frame seriale a ogni variazione di connessione o di IP DHCP, così la dashboard può visualizzare l'indirizzo LAN del modulo.
 * Tutti gli altri pacchetti (inclusi i frame SLIP di `esptool` che iniziano e terminano con `0xC0`): vengono inoltrati trasparentemente senza alcuna alterazione o echo locale.
 
 ---

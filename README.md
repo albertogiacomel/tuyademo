@@ -72,12 +72,18 @@ tuya_dev_kit/
 │
 ├── scripts/                           # Toolchain CLI & build scripts (Cyclopts-powered)
 │   ├── tuya_cli.py                    # Master CLI unificata per build, flash, ping e test
+│   ├── tuya_web.py                    # Dashboard Flask + REST API (:8080), mostra IP LAN del TYWE1S
+│   ├── emqx_bridge.py                 # Bridge MQTT/TLS verso EMQX Cloud (telemetria + comandi)
+│   ├── emqx_cloud.py                  # Client REST API v5 del deployment EMQX (Cyclopts)
+│   ├── emqx_bridge_test.py            # Test unitari bridge EMQX (14 test, nessuna rete)
+│   ├── emqx_cloud_test.py             # Test unitari client REST EMQX (8 test, mock)
 │   └── build_bridges.py               # Compilatore assembler bare-metal idempotente (Keystone + Capstone)
 │
 └── docs/                              # Documentazione tecnica approfondita
     ├── HARDWARE.md                    # Specifiche hardware, pinout, matrice jumper e pulsanti
     ├── FIRMWARE.md                    # Analisi disassemblato, registri STM32 e deadlock ORE
-    ├── PROTOCOLS.md                   # ST Bootloader AN3155, Tuya MCU SDK e ESP8266 SLIP
+    ├── PROTOCOLS.md                   # ST Bootloader AN3155, Tuya MCU SDK, ESP8266 SLIP e comandi bridge
+    ├── EMQX.md                        # Integrazione EMQX Cloud: topic, credenziali, verifiche
     └── RUNBOOK.md                     # Procedure operative, flashing e troubleshooting
 ```
 
@@ -131,6 +137,14 @@ python scripts/tuya_cli.py restore-factory
 # 2. Premere e rilasciare MCU RST per riavviare il firmware di fabbrica
 ```
 
+### Dashboard Web + Bridge EMQX Cloud:
+```powershell
+python scripts/emqx_bridge.py setup   # salva credenziali MQTT nel Credential Manager (EMQX-MQTT)
+python scripts/emqx_bridge.py check   # verifica TLS broker + CONNECT MQTT
+python scripts/tuya_web.py            # dashboard :8080 + bridge EMQX fail-soft (telemetria 5s)
+```
+*La dashboard mostra l'IP LAN del modulo TYWE1S (frame `WIFI:CONNECTED,IP:`); il bridge pubblica su `tuya/tyde3/telemetry` e riceve comandi su `tuya/tyde3/command`. Dettagli in `docs/EMQX.md`.*
+
 ---
 
 ## 📊 4. Tabella di Verifica e Integrità Artefatti
@@ -138,11 +152,17 @@ python scripts/tuya_cli.py restore-factory
 | File Artefatto | Dimensione | Target Hardware | SHA256 / Note |
 | :--- | :---: | :--- | :--- |
 | `firmware/stm32_factory_tuya_backup.bin` | 65.536 B (64 KiB) | STM32 Flash (`0x08000000`) | `012f2171366ef70ea2e1...` (Backup integrale di fabbrica) |
-| `firmware/stm32_pio_smart_bridge.bin` | 20.660 B | STM32 Flash (`0x08000000`) | `102c82be6a4e02a4e8a7...` (C++ PlatformIO: passthrough + ADC1_IN16) |
+| `firmware/stm32_pio_smart_bridge.bin` | 30.472 B | STM32 Flash (`0x08000000`) | `7ea285cf4241...` (C++ PlatformIO: passthrough + ADC1_IN16 + forward `W:?`) |
+| `firmware/tywe1s_wifi_firmware.bin` | 324.752 B | TYWE1S Flash (`0x00000`) | `a87d8e7076db...` (ESP8266: web server, export IP Wi-Fi + frame `WIFI:CONNECTED,IP:`) |
 | `firmware/stm32_uart_smart_bridge.bin` | 512 B | STM32 Flash (`0x08000000`) | `4dee3c41caee3a9c963e...` (Thumb-2 bare-metal JIT: passthrough + ADC16) |
 | `firmware/stm32_uart_echo_bridge.bin` | 256 B | STM32 Flash (`0x08000000`) | `a7224fedfe100917240c...` (Echo Bridge diagnostico) |
 | `scripts/tuya_cli.py` | ~11 KiB | Python 3.10+ (Cyclopts) | Master CLI universale, 0 warnings, ruff compliant |
 | `scripts/build_bridges.py` | ~6 KiB | Python 3.10+ (Keystone) | Compilatore assembler JIT e disassemblatore Capstone |
+| `scripts/tuya_web.py` | 89.341 B | Python 3.10+ (Flask) | Dashboard :8080, IP LAN TYWE1S, integrazione EMQX fail-soft |
+| `scripts/emqx_bridge.py` | 20.338 B | Python 3.10+ (Cyclopts + paho-mqtt) | Bridge MQTT/TLS verso EMQX, credenziali via Credential Manager |
+| `scripts/emqx_cloud.py` | 7.528 B | Python 3.10+ (Cyclopts + requests) | Client REST API v5 deployment EMQX (check/clients/publish) |
+| `scripts/emqx_bridge_test.py` | 7.036 B | Python 3.10+ (unittest) | 14/14 test OK, nessuna chiamata di rete |
+| `scripts/emqx_cloud_test.py` | 5.347 B | Python 3.10+ (unittest) | 8/8 test OK, requests mockato |
 
 ---
 

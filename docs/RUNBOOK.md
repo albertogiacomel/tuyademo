@@ -74,6 +74,29 @@ python scripts/build_bridges.py
 
 ---
 
+## ☁️ Scenario 6: Bridge EMQX Cloud (Telemetria + Comandi Remoti)
+
+Endpoint verificato: `r202df21.ala.eu-central-1.emqxsl.com:8883` (TLSv1.3, DigiCert DV, scadenza 2027-02-26).
+
+1. **Crea le credenziali client** nella console EMQX (Deployment → Client Authentication → utente) e salvale nel Credential Manager:
+   ```powershell
+   python scripts/emqx_bridge.py setup
+   ```
+2. **Verifica TLS + CONNECT**:
+   ```powershell
+   python scripts/emqx_bridge.py check
+   ```
+3. **Avvia la dashboard** (il bridge parte in automatico, fail-soft):
+   ```powershell
+   python scripts/tuya_web.py
+   ```
+4. **Verifica in console EMQX** → Monitoring → Clients: il client `tyde3-server-*` compare connesso con l'IP del **server** (es. `192.168.1.125`), non quello della scheda Tuya. L'IP LAN del modulo è mostrato dalla dashboard (campo "Indirizzo IP sulla LAN").
+5. **Test telemetria/comandi** da MQTTX:
+   * Pubblica `{"cmd":"rgb","r":255,"g":0,"b":0}` su `tuya/tyde3/command`.
+   * Ascolta `tuya/tyde3/telemetry` (ogni 5 s) e `tuya/tyde3/ack`.
+
+---
+
 ## ⚠️ Matrice di Troubleshooting
 
 | Sintomo / Errore | Possibile Causa | Azione Correttiva |

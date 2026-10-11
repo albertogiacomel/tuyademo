@@ -1,13 +1,14 @@
 /**
  * @file main.cpp
- * @brief Smart UART Bridge & Advanced RGB/Sensors Firmware for Tuya TYDE 3.0 IoT Dev Kit
+ * @brief Smart UART Bridge & Advanced RGB/Sensors Firmware with Tuya MCU Protocol for Tuya TYDE 3.0
  * 
  * Target MCU: STM32F103C8T6 (72MHz ARM Cortex-M3)
  * Exact Pinout reverse-engineered from factory firmware:
  * - Status LEDs (Active Low): PB6 (LED1), PB5 (LED2)
+ * - LED3: Physically driven on TYWE1S module via Tuya Wi-Fi state protocol (PB4/PC13 fallback)
  * - RGB LED (Active Low PWM on TIM4): PB8 (Red), PB9 (Green), PB7 (Blue)
  * - User Buttons (Active Low): PA11 (Key1), PA12 (Key2)
- * - Serial: PA9/PA10 (USART1), PB10/PB11 (USART3)
+ * - Serial: PA9/PA10 (USART1 @ 115200 to PC USB), PB10/PB11 (USART3 @ 9600 to TYWE1S Tuya module)
  */
 
 #include <Arduino.h>
@@ -21,7 +22,6 @@ enum RgbMode {
 };
 
 static RgbMode current_rgb_mode = RGB_MODE_TEMP; // Default: Visual Core Temperature Monitor
-static uint32_t last_heartbeat = 0;
 static uint32_t last_temp_update = 0;
 static uint32_t last_rainbow_update = 0;
 static uint16_t rainbow_hue = 0;
@@ -30,6 +30,9 @@ static float current_temp_c = 25.0f;
 
 // --- Wi-Fi Connection & LED3 Status Tracking ---
 static bool wifi_connected = false;
+static uint8_t tuya_wifi_state = 0xFF; // 0=SmartConfig/EZ, 1=AP, 2=Connecting, 3=Router, 4=Cloud, 5=Timeout
+static uint32_t last_tuya_heartbeat_sent = 0;
+static uint32_t last_tuya_heartbeat_recv = 0;
 
 // --- Individual Control for the 3 On-Board Status LEDs ---
 struct StatusLed {
@@ -60,10 +63,7 @@ void set_led_ctrl(uint8_t id, uint8_t mode, uint16_t period_ms) {
     } else if (id == 3) {
         digitalWrite(PB4, lvl);
         digitalWrite(PC13, lvl);
-        char l_cmd[32];
-        const char* m_str = (mode == 0) ? "OFF" : ((mode == 1) ? "ON" : "BLINK");
-        snprintf(l_cmd, sizeof(l_cmd), "L:3,%s,%d\r\n", m_str, leds[idx].period_ms);
-        Serial3.print(l_cmd);
+        wifi_connected = (mode == 1);
     }
 }
 
@@ -79,7 +79,6 @@ static bool last_key1_state = HIGH;
 static uint8_t cur_r = 0, cur_g = 0, cur_b = 0;
 
 // CIE 1931 perceptual lightness table for 12-bit PWM (0..4095) across 0..100% brightness
-// Maps human logarithmic eye response to linear perceived luminous sensation
 static const uint16_t CIE_12BIT[101] = {
        0,    5,    9,   14,   18,   23,   27,   32,   36,   41,
       46,   52,   58,   64,   71,   78,   86,   94,  103,  112,
@@ -130,12 +129,6 @@ void set_rgb_pwm(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 void update_temp_color(float temp_c) {
-    // Visual temperature mapping (realistic operational thermal thresholds):
-    // < 32°C: Pure Blue (0, 0, 255)
-    // 32 - 36°C: Cyan (0, 255, 255)
-    // 36 - 42°C: Green (0, 255, 0) - Normal operational MCU range (~34-37°C)
-    // 42 - 50°C: Yellow/Amber (255, 180, 0)
-    // > 50°C: Warning Red (255, 0, 0)
     if (temp_c < 32.0f) {
         set_rgb_pwm(0, 50, 255); // Cool Blue
     } else if (temp_c < 36.0f) {
@@ -204,6 +197,223 @@ void jump_to_bootloader() {
     SysMemBootJump();
 }
 
+// ==============================================================================
+// TUYA MCU PROTOCOL ENGINE (USART3 @ 9600 BAUD)
+// ==============================================================================
+
+// Tuya Frame Header: 0x55 0xAA, Version: 0x00
+void tuya_send_frame(uint8_t cmd, const uint8_t* payload, uint16_t len) {
+    Serial3.write((uint8_t)0x55);
+    Serial3.write((uint8_t)0xAA);
+    Serial3.write((uint8_t)0x00); // Version 0x00
+    Serial3.write(cmd);
+    Serial3.write((uint8_t)(len >> 8));
+    Serial3.write((uint8_t)(len & 0xFF));
+
+    uint8_t chk = (uint8_t)(0x55 + 0xAA + 0x00 + cmd + (len >> 8) + (len & 0xFF));
+    for (uint16_t i = 0; i < len; i++) {
+        Serial3.write(payload[i]);
+        chk += payload[i];
+    }
+    Serial3.write(chk);
+    Serial3.flush();
+}
+
+void tuya_start_pairing_ap() {
+    // CMD 0x04: Reset Wi-Fi credentials on TYWE1S
+    tuya_send_frame(0x04, nullptr, 0);
+    delay(40);
+    // CMD 0x05: Select AP mode (0x01) -> Hotspot SmartLife-xxxx active
+    uint8_t m = 1;
+    tuya_send_frame(0x05, &m, 1);
+    wifi_connected = false;
+    tuya_wifi_state = 1;
+    set_led_ctrl(3, 2, 500); // Blink 0.5s
+    set_led_ctrl(1, 2, 500);
+}
+
+void tuya_start_pairing_ez() {
+    // CMD 0x04: Reset Wi-Fi credentials on TYWE1S
+    tuya_send_frame(0x04, nullptr, 0);
+    delay(40);
+    // CMD 0x05: Select EZ / SmartConfig mode (0x00) -> Rapid blink
+    uint8_t m = 0;
+    tuya_send_frame(0x05, &m, 1);
+    wifi_connected = false;
+    tuya_wifi_state = 0;
+    set_led_ctrl(3, 2, 250); // Rapid blink
+    set_led_ctrl(1, 2, 250);
+}
+
+void tuya_query_wifi_state() {
+    tuya_send_frame(0x03, nullptr, 0);
+}
+
+void tuya_handle_rx_frame(uint8_t cmd, const uint8_t* payload, uint16_t len) {
+    switch (cmd) {
+        case 0x00: // Heartbeat response from TYWE1S
+            last_tuya_heartbeat_recv = millis();
+            break;
+
+        case 0x01: { // Product Information query
+            // Exact factory response: PID "qWGOYA4uqW9odEQk" (16 bytes) + version "3.0.3" (5 bytes) = 21 bytes
+            const uint8_t prod_info[] = "qWGOYA4uqW9odEQk3.0.3";
+            tuya_send_frame(0x01, prod_info, 21);
+            Serial.print("[TUYA] INFO_REPLIED:qWGOYA4uqW9odEQk3.0.3\r\n");
+            break;
+        }
+
+        case 0x02: { // Working Mode query
+            // Length 0: cooperative network mode
+            tuya_send_frame(0x02, nullptr, 0);
+            Serial.print("[TUYA] WORK_MODE_REPLIED\r\n");
+            break;
+        }
+
+        case 0x03: { // Wi-Fi Network Status report from TYWE1S
+            if (len >= 1) {
+                tuya_wifi_state = payload[0];
+                if (tuya_wifi_state == 3 || tuya_wifi_state == 4) {
+                    // Connected to Router (3) or Tuya Cloud (4)
+                    wifi_connected = true;
+                    set_led_ctrl(3, 1, 0); // Solid ON
+                    set_led_ctrl(1, 1, 0);
+                    Serial.print("WIFI:CONNECTED,STATE:");
+                    Serial.print(tuya_wifi_state);
+                    Serial.print("\r\n");
+                } else {
+                    // 0 = EZ/SmartConfig, 1 = AP pairing, 2 = Connecting, 5 = Timeout
+                    wifi_connected = false;
+                    uint16_t period = (tuya_wifi_state == 0) ? 250 : 500;
+                    set_led_ctrl(3, 2, period); // Blink 0.5s or 0.25s
+                    set_led_ctrl(1, 2, period);
+                    Serial.print("WIFI:DISCONNECTED,STATE:");
+                    Serial.print(tuya_wifi_state);
+                    Serial.print("\r\n");
+                }
+            }
+            // Reply ACK length 0 to report
+            tuya_send_frame(0x03, nullptr, 0);
+            break;
+        }
+
+        case 0x04: // Reset Wi-Fi ACK
+            wifi_connected = false;
+            tuya_wifi_state = 1;
+            set_led_ctrl(3, 2, 500);
+            Serial.print("WIFI:RESET_ACK\r\n");
+            break;
+
+        case 0x05: // Wi-Fi Mode ACK
+            Serial.print("WIFI:MODE_ACK\r\n");
+            break;
+
+        case 0x06: // DP Command from Cloud/App (Downlink)
+            // Send ACK length 0
+            tuya_send_frame(0x06, nullptr, 0);
+            Serial.print("[TUYA] DP_DOWNLINK\r\n");
+            break;
+
+        default:
+            break;
+    }
+}
+
+// State machine for Tuya protocol receiver
+enum TuyaParserState {
+    TP_WAIT_55 = 0,
+    TP_WAIT_AA,
+    TP_WAIT_VER,
+    TP_WAIT_CMD,
+    TP_WAIT_LEN_H,
+    TP_WAIT_LEN_L,
+    TP_WAIT_DATA,
+    TP_WAIT_CHK
+};
+
+static TuyaParserState tuya_state = TP_WAIT_55;
+static uint8_t tuya_rx_ver = 0;
+static uint8_t tuya_rx_cmd = 0;
+static uint16_t tuya_rx_len = 0;
+static uint16_t tuya_rx_idx = 0;
+static uint8_t tuya_rx_buf[256];
+static uint8_t tuya_calc_chk = 0;
+
+void process_tuya_serial() {
+    while (Serial3.available()) {
+        uint8_t b = (uint8_t)Serial3.read();
+        switch (tuya_state) {
+            case TP_WAIT_55:
+                if (b == 0x55) {
+                    tuya_state = TP_WAIT_AA;
+                    tuya_calc_chk = 0x55;
+                }
+                break;
+
+            case TP_WAIT_AA:
+                if (b == 0xAA) {
+                    tuya_state = TP_WAIT_VER;
+                    tuya_calc_chk += 0xAA;
+                } else if (b == 0x55) {
+                    tuya_calc_chk = 0x55; // Keep waiting for AA
+                } else {
+                    tuya_state = TP_WAIT_55;
+                }
+                break;
+
+            case TP_WAIT_VER:
+                tuya_rx_ver = b;
+                tuya_calc_chk += b;
+                tuya_state = TP_WAIT_CMD;
+                break;
+
+            case TP_WAIT_CMD:
+                tuya_rx_cmd = b;
+                tuya_calc_chk += b;
+                tuya_state = TP_WAIT_LEN_H;
+                break;
+
+            case TP_WAIT_LEN_H:
+                tuya_rx_len = ((uint16_t)b) << 8;
+                tuya_calc_chk += b;
+                tuya_state = TP_WAIT_LEN_L;
+                break;
+
+            case TP_WAIT_LEN_L:
+                tuya_rx_len |= b;
+                tuya_calc_chk += b;
+                tuya_rx_idx = 0;
+                if (tuya_rx_len == 0) {
+                    tuya_state = TP_WAIT_CHK;
+                } else if (tuya_rx_len > sizeof(tuya_rx_buf)) {
+                    tuya_state = TP_WAIT_55; // Buffer overflow safeguard
+                } else {
+                    tuya_state = TP_WAIT_DATA;
+                }
+                break;
+
+            case TP_WAIT_DATA:
+                tuya_rx_buf[tuya_rx_idx++] = b;
+                tuya_calc_chk += b;
+                if (tuya_rx_idx >= tuya_rx_len) {
+                    tuya_state = TP_WAIT_CHK;
+                }
+                break;
+
+            case TP_WAIT_CHK:
+                if (b == tuya_calc_chk) {
+                    tuya_handle_rx_frame(tuya_rx_cmd, tuya_rx_buf, tuya_rx_len);
+                }
+                tuya_state = TP_WAIT_55;
+                break;
+        }
+    }
+}
+
+// ==============================================================================
+// SETUP & MAIN LOOP
+// ==============================================================================
+
 void setup() {
     // Configure status LEDs (Active Low)
     pinMode(PIN_LED1, OUTPUT);
@@ -229,23 +439,40 @@ void setup() {
     // Initialize ADC for 12-bit internal temperature sensor & VREFINT
     analogReadResolution(12);
 
-    // Initialize Serial1 (PC USB @ 115200) and Serial3 (TYWE1S @ 115200)
+    // Initialize Serial1 (PC USB @ 115200)
     Serial.setRx(PIN_UART1_RX);
     Serial.setTx(PIN_UART1_TX);
     Serial.begin(115200);
 
+    // Initialize Serial3 (TYWE1S Tuya module @ 9600 BAUD)
     Serial3.setRx(PIN_UART3_RX);
     Serial3.setTx(PIN_UART3_TX);
-    Serial3.begin(115200);
+    Serial3.begin(9600);
 
     // Initial temperature measurement
     int rt, rv; float vdd;
     current_temp_c = measure_temperature(rt, rv, vdd);
     update_temp_color(current_temp_c);
+
+    // Initial heartbeat to TYWE1S
+    delay(50);
+    tuya_send_frame(0x00, nullptr, 0);
+    last_tuya_heartbeat_sent = millis();
 }
 
 void loop() {
-    // --- 1. Forward from PC (Serial) to Wi-Fi (Serial3) with command interception ---
+    uint32_t now = millis();
+
+    // --- 1. Process Tuya Protocol on Serial3 (TYWE1S @ 9600 baud) ---
+    process_tuya_serial();
+
+    // Periodic Heartbeat every 1500ms to keep Tuya Wi-Fi module active
+    if (now - last_tuya_heartbeat_sent >= 1500) {
+        last_tuya_heartbeat_sent = now;
+        tuya_send_frame(0x00, nullptr, 0);
+    }
+
+    // --- 2. Process Commands from PC USB (Serial @ 115200 baud) ---
     while (Serial.available()) {
         int c = Serial.peek();
         if (c == '?') {
@@ -266,7 +493,7 @@ void loop() {
             Serial.print(buf);
             continue;
         } else if (c == 'C' || c == 'c') {
-            // RGB command: C:<r>,<g>,<b> or C:TEMP or C:RAINBOW or C:OFF
+            // RGB command: C:<r>,<g>,<b> or C:TEMP or C:RAINBOW or C:OFF or C:WIFI:<0|1> or C:B:<val>
             String cmd = Serial.readStringUntil('\n');
             cmd.trim();
             if (cmd.startsWith("C:") || cmd.startsWith("c:")) {
@@ -317,7 +544,7 @@ void loop() {
             // LED command: L:<id>,<mode>,<period> or L:?
             String cmd = Serial.readStringUntil('\n');
             cmd.trim();
-            if (cmd == "L:?" || cmd == "l:?") {
+            if (cmd.equalsIgnoreCase("L:?")) {
                 char qbuf[96];
                 snprintf(qbuf, sizeof(qbuf), "LED:1=%d,%d;2=%d,%d;3=%d,%d\r\n",
                          leds[0].mode, leds[0].period_ms,
@@ -346,20 +573,30 @@ void loop() {
             }
             continue;
         } else if (c == 'W' || c == 'w') {
-            // Wi-Fi commands: W:<ssid>,<password> or W:DISCONNECT
+            // Wi-Fi commands
             String cmd = Serial.readStringUntil('\n');
             cmd.trim();
-            if (cmd.equalsIgnoreCase("W:DISCONNECT") || cmd.equalsIgnoreCase("W:RESET")) {
-                Serial3.print("W:DISCONNECT\r\n");
-                wifi_connected = false;
-                set_led_ctrl(3, 2, 500); // Active Low: 0.5s Blink (Waiting for pairing)
-                Serial.print("WIFI:OK:DISCONNECTED\r\n");
+            if (cmd.equalsIgnoreCase("W:?") || cmd.equalsIgnoreCase("W:STATUS")) {
+                tuya_query_wifi_state();
+                if (wifi_connected) {
+                    Serial.print("WIFI:CONNECTED,STATE:");
+                    Serial.print(tuya_wifi_state);
+                    Serial.print(",LED3:SOLID_ON\r\n");
+                } else {
+                    Serial.print("WIFI:DISCONNECTED,STATE:");
+                    Serial.print(tuya_wifi_state);
+                    Serial.print(",LED3:BLINK_0_5S\r\n");
+                }
+                continue;
+            } else if (cmd.equalsIgnoreCase("W:PAIR:AP") || cmd.equalsIgnoreCase("W:DISCONNECT") || cmd.equalsIgnoreCase("W:RESET")) {
+                tuya_start_pairing_ap();
+                continue;
+            } else if (cmd.equalsIgnoreCase("W:PAIR:EZ") || cmd.equalsIgnoreCase("W:PAIR")) {
+                tuya_start_pairing_ez();
                 continue;
             } else if (cmd.startsWith("W:") || cmd.startsWith("w:")) {
-                Serial3.print(cmd);
-                Serial3.print("\r\n");
-                wifi_connected = true;
-                set_led_ctrl(3, 1, 0);
+                // Config sent from Web dashboard: trigger AP pairing mode so TYWE1S is visible for phone pairing
+                tuya_start_pairing_ap();
                 Serial.print("WIFI:CONFIG_SENT\r\n");
                 continue;
             }
@@ -369,46 +606,11 @@ void loop() {
             return;
         }
         
-        // Pass byte to TYWE1S
-        c = Serial.read();
-        Serial3.write((uint8_t)c);
-    }
-
-    // --- 2. Forward from Wi-Fi (Serial3) to PC (Serial) & Detect Wi-Fi Status ---
-    static String s3_line = "";
-    while (Serial3.available()) {
-        int c = Serial3.read();
-        Serial.write((uint8_t)c);
-        if (c == '\n') {
-            s3_line.trim();
-            if (s3_line.indexOf("WIFI:CONNECTED") >= 0) {
-                wifi_connected = true;
-                set_led_ctrl(3, 1, 0);
-            } else if (s3_line.indexOf("WIFI:DISCONNECTED") >= 0) {
-                wifi_connected = false;
-                set_led_ctrl(3, 2, 500);
-            } else if (s3_line.startsWith("L:") || s3_line.startsWith("l:")) {
-                String val = s3_line.substring(2);
-                int first_comma = val.indexOf(',');
-                int second_comma = val.indexOf(',', first_comma + 1);
-                if (first_comma > 0) {
-                    int id = val.substring(0, first_comma).toInt();
-                    String m_str = (second_comma > 0) ? val.substring(first_comma + 1, second_comma) : val.substring(first_comma + 1);
-                    int period = (second_comma > 0) ? val.substring(second_comma + 1).toInt() : 500;
-                    m_str.toUpperCase();
-                    m_str.trim();
-                    uint8_t mode = (m_str == "ON" || m_str == "1") ? 1 : ((m_str == "BLINK" || m_str == "2") ? 2 : 0);
-                    set_led_ctrl(id, mode, period);
-                }
-            }
-            s3_line = "";
-        } else if (c != '\r') {
-            if (s3_line.length() < 64) s3_line += (char)c;
-        }
+        // Discard any unrecognized byte from PC
+        Serial.read();
     }
 
     // --- 3. Individual Status LEDs 1, 2, 3 Scheduler ---
-    uint32_t now = millis();
     for (int i = 0; i < 3; i++) {
         if (leds[i].mode == 2) {
             if (now - leds[i].last_toggle >= leds[i].period_ms) {
@@ -463,7 +665,7 @@ void loop() {
     }
     last_key2_state = key2;
 
-    // --- 7. User Button 1 (PA11): Hold to smoothly ramp brightness / Click to step ---
+    // --- 7. User Button 1 (PA11): Hold 3s to enter Wi-Fi Pairing, ramp brightness, or step on click ---
     bool key1 = digitalRead(PIN_KEY1);
     if (key1 == LOW && last_key1_state == HIGH) {
         // Button 1 just pressed down
@@ -474,15 +676,19 @@ void loop() {
         if (!key1_is_held && (now - key1_press_start >= 350)) {
             key1_is_held = true;
         }
-        if (key1_is_held && (now - last_brightness_ramp >= 20)) {
+        // Long hold (> 3000ms): Trigger Wi-Fi pairing reset (same as Tuya factory firmware!)
+        if (now - key1_press_start >= 3000 && !wifi_connected) {
+            tuya_start_pairing_ap();
+            key1_press_start = now + 10000; // Prevent repeated triggers
+        } else if (key1_is_held && (now - last_brightness_ramp >= 20)) {
             last_brightness_ramp = now;
             int new_bright = (int)current_brightness + brightness_dir;
             if (new_bright <= 5) {
                 new_bright = 5;
-                brightness_dir = 1; // Reverse: now ramp up
+                brightness_dir = 1; // Reverse: ramp up
             } else if (new_bright >= 100) {
                 new_bright = 100;
-                brightness_dir = -1; // Reverse: now ramp down
+                brightness_dir = -1; // Reverse: ramp down
             }
             current_brightness = (uint8_t)new_bright;
             apply_rgb_brightness();
@@ -504,7 +710,6 @@ void loop() {
             }
             apply_rgb_brightness();
         } else {
-            // After holding, reverse direction for the next hold
             brightness_dir = -brightness_dir;
         }
         key1_is_held = false;

@@ -48,14 +48,46 @@ Protocollo seriale a pacchetti utilizzato tra la MCU STM32 (su USART3) e il modu
 
 ### Comandi Standard Tuya MCU:
 
-| Comando | Nome | Direzione | Payload di Esempio | Descrizione |
+### Parametri di Connessione Tuya MCU (USART3 PB10/PB11 ↔ TYWE1S):
+* **Baudrate**: **9600 baud** (8N1) — verificato per disassemblaggio del firmware di fabbrica STM32 (`mov.w r0, #0x2580` = 9600 dec).
+* **Product ID (PID)**: `"qWGOYA4uqW9odEQk"`
+* **Versione Firmware MCU**: `"3.0.3"`
+
+### Comandi Standard Tuya MCU (9600 baud, framing 0x55 0xAA):
+
+| Comando | Nome | Direzione | Payload / Frame di Esempio | Descrizione |
 | :---: | :--- | :---: | :--- | :--- |
-| `0x00` | **Heartbeat** | MCU -> Wi-Fi | `55 AA 00 00 00 00 FF` | Ping periodico di presenza (inviato ogni 1-3 secondi). Il Wi-Fi risponde con il proprio stato. |
-| `0x01` | **Product Info Query** | Wi-Fi -> MCU | `55 AA 00 01 00 00 00` | Richiede il Product ID (PID) e la versione software dell'MCU. |
-| `0x02` | **Working Mode** | MCU <-> Wi-Fi | `55 AA 00 02 00 00 01` | Sincronizza la modalità di gestione degli stati di rete e dei LED. |
-| `0x03` | **Wi-Fi State** | Wi-Fi -> MCU | `55 AA 00 03 00 01 SS KK` | Notifica stato rete: `00` SmartConfig, `01` AP mode, `02` Wi-Fi OK, `03` Cloud Connesso. |
-| `0x06` | **Command Send** | Wi-Fi -> MCU | `55 AA 00 06 ...` | Invia comandi di controllo provenienti dall'App o dal Cloud (es. accendi relè). |
-| `0x07` | **Status Report** | MCU -> Wi-Fi | `55 AA 00 07 ...` | Riporta al cloud il valore corrente dei sensori (Data Point - DP). |
+| `0x00` | **Heartbeat** | MCU ↔ Wi-Fi | `55 AA 00 00 00 00 FF` | Ping periodico di presenza (inviato ogni 1.5 secondi da STM32). Il TYWE1S risponde con ACK. |
+| `0x01` | **Product Info Query** | Wi-Fi -> MCU | `55 AA 00 01 00 00 00` | Richiede PID e versione software. STM32 risponde con `qWGOYA4uqW9odEQk3.0.3` (21 byte). |
+| `0x02` | **Working Mode** | MCU <-> Wi-Fi | `55 AA 00 02 00 00 01` | Notifica modalità cooperativa MCU/Wi-Fi (lunghezza 0). |
+| `0x03` | **Wi-Fi State** | Wi-Fi -> MCU | `55 AA 00 03 00 01 <state> <chk>` | Notifica stato rete: `0` SmartConfig/EZ, `1` AP mode, `2` Connecting, `3` Router connesso, `4` Cloud Tuya connesso, `5` Timeout. |
+| `0x04` | **Reset Wi-Fi** | MCU -> Wi-Fi | `55 AA 00 04 00 00 03` | Cancella credenziali Wi-Fi correnti sul TYWE1S e avvia pairing. |
+| `0x05` | **Select Mode** | MCU -> Wi-Fi | `55 AA 00 05 00 01 01 06` (AP) / `00 05` (EZ) | Seleziona modalità pairing AP (Hotspot SmartLife-xxxx) o SmartConfig rapido EZ. |
+| `0x06` | **Command Send** | Wi-Fi -> MCU | `55 AA 00 06 ...` | Invia comandi di controllo provenienti dall'App Tuya / Cloud (DP stream). |
+
+### Comportamento LED 3 (Indicatore Wi-Fi):
+* **Fisico sul modulo TYWE1S**: LED3 è fisicamente pilotato dal modulo Wi-Fi TYWE1S.
+* **In Connessione / Connesso**: Se connesso al router (`STATE 3` o `4`), LED 3 rimane **ACCESO FISSO**.
+* **In Ricerca / Pairing / Disconnesso**: Se disconnesso o in pairing AP/EZ (`STATE 0`, `1`, `2`), LED 3 **lampeggia con frequenza 0.5 sec** (o 0.25 sec in EZ).
+
+---
+
+Sulla scheda Tuya TYDE 3.0, il canale PC ↔ STM32 (USART1 PA9/PA10 @ 115200 baud) espone la console di controllo per la Web Dashboard:
+
+### Comandi PC → STM32 (USART1 @ 115200 baud)
+
+| Comando | Risposta | Descrizione |
+| :--- | :--- | :--- |
+| `?` | `OK` | Ping diagnostico del runtime STM32 |
+| `T` | `T:XXXX,V:YYYY,VDD:3.29V,TEMP:35.9C` | Telemetria ADC (temperatura die + VREFINT) |
+| `C:<r>,<g>,<b>` | `RGB:OK` | Colore LED RGB on-board |
+| `C:TEMP` / `C:RAINBOW` / `C:OFF` | `RGB:...` | Modalità RGB |
+| `C:B:<0-100>` | `RGB:BRIGHT:<n>` | Luminosità |
+| `L:<id>,<mode>,<ms>` | `LED:OK` | LED di stato 1-3 (ON/OFF/BLINK) |
+| `L:?` | `LED:1=2,500;2=1,500;3=2,500` | Stato LED |
+| `W:PAIR:AP` / `W:DISCONNECT` | `WIFI:OK:PAIRING_AP` | Disconnette dalla LAN e avvia pairing AP (hotspot cellulare) |
+| `W:PAIR:EZ` / `W:PAIR` | `WIFI:OK:PAIRING_EZ` | Avvia pairing rapido EZ per app Tuya Smart |
+| `W:?` / `W:STATUS` | `WIFI:CONNECTED,STATE:<n>,LED3:SOLID_ON` | Query stato Wi-Fi nativo Tuya |
 
 ---
 
