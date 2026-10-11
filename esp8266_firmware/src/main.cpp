@@ -325,6 +325,9 @@ void setup() {
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASS);
 
+    // Auto-connect to Vodafone-30456263
+    WiFi.begin("Vodafone-30456263", "lm4jx7c9bss9pwi");
+
     // REST API Routes
     server.on("/", HTTP_GET, handleRoot);
     server.on("/api/status", HTTP_GET, handleApiStatus);

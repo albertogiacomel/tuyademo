@@ -62,6 +62,7 @@ void set_led_ctrl(uint8_t id, uint8_t mode, uint16_t period_ms) {
         digitalWrite(PIN_LED2, lvl);
     } else if (id == 3) {
         digitalWrite(PB4, lvl);
+        digitalWrite(PB3, lvl);
         digitalWrite(PC13, lvl);
         wifi_connected = (mode == 1);
     }
@@ -195,6 +196,43 @@ void jump_to_bootloader() {
     void (*SysMemBootJump)(void) = (void (*)(void))(*((uint32_t *)0x1FFFF004));
     __set_MSP(*((uint32_t *)0x1FFFF000));
     SysMemBootJump();
+}
+
+void enter_pure_passthrough() {
+    Serial.print("PASSTHROUGH_ACTIVE\r\n");
+    Serial.flush();
+    digitalWrite(PIN_LED2, LOW); // Active Low: LED2 ON solid to indicate passthrough mode
+
+    // Disable UART interrupts so this tight 72MHz hardware register loop
+    // has 100% exclusive access without HAL ISR interference.
+    USART1->CR1 &= ~(USART_CR1_RXNEIE | USART_CR1_TXEIE | USART_CR1_TCIE | USART_CR1_PEIE);
+    USART3->CR1 &= ~(USART_CR1_RXNEIE | USART_CR1_TXEIE | USART_CR1_TCIE | USART_CR1_PEIE);
+    NVIC_DisableIRQ(USART1_IRQn);
+    NVIC_DisableIRQ(USART3_IRQn);
+
+    while (true) {
+        // Forward PC (USART1) -> TYWE1S (USART3)
+        uint32_t sr1 = USART1->SR;
+        if (sr1 & USART_SR_RXNE) {
+            uint8_t b = (uint8_t)(USART1->DR & 0xFF);
+            while (!(USART3->SR & USART_SR_TXE));
+            USART3->DR = b;
+        } else if (sr1 & USART_SR_ORE) {
+            volatile uint32_t dr1 = USART1->DR;
+            (void)dr1;
+        }
+
+        // Forward TYWE1S (USART3) -> PC (USART1)
+        uint32_t sr3 = USART3->SR;
+        if (sr3 & USART_SR_RXNE) {
+            uint8_t b = (uint8_t)(USART3->DR & 0xFF);
+            while (!(USART1->SR & USART_SR_TXE));
+            USART1->DR = b;
+        } else if (sr3 & USART_SR_ORE) {
+            volatile uint32_t dr3 = USART3->DR;
+            (void)dr3;
+        }
+    }
 }
 
 // ==============================================================================
@@ -415,14 +453,20 @@ void process_tuya_serial() {
 // ==============================================================================
 
 void setup() {
+    // Release PB4 (JNTRST) and PB3 (JTDO) from JTAG while keeping SWD debugging active
+    __HAL_RCC_AFIO_CLK_ENABLE();
+    __HAL_AFIO_REMAP_SWJ_NOJTAG();
+
     // Configure status LEDs (Active Low)
     pinMode(PIN_LED1, OUTPUT);
     pinMode(PIN_LED2, OUTPUT);
     pinMode(PB4, OUTPUT);
+    pinMode(PB3, OUTPUT);
     pinMode(PC13, OUTPUT);
     digitalWrite(PIN_LED1, HIGH); // OFF initially
     digitalWrite(PIN_LED2, LOW);  // ON (MCU Alive)
     digitalWrite(PB4, HIGH);
+    digitalWrite(PB3, HIGH);
     digitalWrite(PC13, HIGH);
 
     // Configure user buttons
@@ -444,32 +488,40 @@ void setup() {
     Serial.setTx(PIN_UART1_TX);
     Serial.begin(115200);
 
-    // Initialize Serial3 (TYWE1S Tuya module @ 9600 BAUD)
+    // Initialize Serial3 (TYWE1S module @ 115200 BAUD)
     Serial3.setRx(PIN_UART3_RX);
     Serial3.setTx(PIN_UART3_TX);
-    Serial3.begin(9600);
+    Serial3.begin(115200);
 
     // Initial temperature measurement
     int rt, rv; float vdd;
     current_temp_c = measure_temperature(rt, rv, vdd);
     update_temp_color(current_temp_c);
-
-    // Initial heartbeat to TYWE1S
-    delay(50);
-    tuya_send_frame(0x00, nullptr, 0);
-    last_tuya_heartbeat_sent = millis();
 }
 
 void loop() {
     uint32_t now = millis();
 
-    // --- 1. Process Tuya Protocol on Serial3 (TYWE1S @ 9600 baud) ---
-    process_tuya_serial();
-
-    // Periodic Heartbeat every 1500ms to keep Tuya Wi-Fi module active
-    if (now - last_tuya_heartbeat_sent >= 1500) {
-        last_tuya_heartbeat_sent = now;
-        tuya_send_frame(0x00, nullptr, 0);
+    // --- 1. Forward from TYWE1S (Serial3 @ 115200) to PC (Serial) & Track WiFi state ---
+    static String s3_line = "";
+    while (Serial3.available()) {
+        int sc = Serial3.read();
+        Serial.write((uint8_t)sc);
+        if (sc == '\n') {
+            s3_line.trim();
+            if (s3_line.indexOf("WIFI:CONNECTED") >= 0) {
+                wifi_connected = true;
+                set_led_ctrl(3, 1, 500); // Solid ON
+                set_led_ctrl(1, 1, 500);
+            } else if (s3_line.indexOf("WIFI:DISCONNECTED") >= 0) {
+                wifi_connected = false;
+                set_led_ctrl(3, 2, 500); // Blink 0.5s
+                set_led_ctrl(1, 2, 500);
+            }
+            s3_line = "";
+        } else if (sc != '\r') {
+            if (s3_line.length() < 96) s3_line += (char)sc;
+        }
     }
 
     // --- 2. Process Commands from PC USB (Serial @ 115200 baud) ---
@@ -600,14 +652,22 @@ void loop() {
                 Serial.print("WIFI:CONFIG_SENT\r\n");
                 continue;
             }
+        } else if (c == 'P' || c == 'p') {
+            String cmd = Serial.readStringUntil('\n');
+            cmd.trim();
+            if (cmd.equalsIgnoreCase("P") || cmd.equalsIgnoreCase("PASSTHROUGH")) {
+                enter_pure_passthrough();
+                return;
+            }
         } else if (c == 'B') {
             Serial.read();
             jump_to_bootloader();
             return;
         }
         
-        // Discard any unrecognized byte from PC
-        Serial.read();
+        // Pass any other byte (esptool / raw traffic) to TYWE1S
+        c = Serial.read();
+        Serial3.write((uint8_t)c);
     }
 
     // --- 3. Individual Status LEDs 1, 2, 3 Scheduler ---
@@ -621,6 +681,7 @@ void loop() {
                 else if (i == 1) digitalWrite(PIN_LED2, lvl);
                 else if (i == 2) {
                     digitalWrite(PB4, lvl);
+                    digitalWrite(PB3, lvl);
                     digitalWrite(PC13, lvl);
                 }
             }

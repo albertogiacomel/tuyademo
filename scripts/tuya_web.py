@@ -392,7 +392,11 @@ class BoardBridge:
         resp = self.send_cmd(f"W:{ssid},{password}")
         if "CONFIG_SENT" in resp or "OK" in resp:
             self.status["wifi_ssid"] = ssid
-            self.set_wifi_connected(True)
+            self.status["wifi_connected"] = False
+            self.status["wifi_ip"] = None
+            if "3" in self.status["leds"]:
+                self.status["leds"]["3"]["mode"] = "BLINK"
+                self.status["leds"]["3"]["period_ms"] = 500
             try:
                 CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
                 CONFIG_FILE.write_text(
@@ -629,8 +633,10 @@ def create_app(bridge: BoardBridge) -> Flask:
             {
                 "ok": ok,
                 "ssid": ssid,
+                "connected": False,
+                "pairing_mode": "AP",
                 "message": (
-                    f"Credenziali inviate al modulo TYWE1S per la rete '{ssid}'"
+                    f"Modalità Pairing AP attivata per la rete '{ssid}' (Hotspot SmartLife-xxxx attivo)."
                     if ok
                     else "Errore di trasmissione verso la scheda Tuya"
                 ),
@@ -1530,9 +1536,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="led-header">
             <div class="led-title">
               <span id="led1Dot" class="led-indicator blink"></span>
-              <span>LED 1 <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">(Pin PB6 • Active Low)</span></span>
+              <span>LED 1 <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">(Pin PB6 • Indicatore Wi-Fi Tuya Fisico)</span></span>
             </div>
             <span id="led1Badge" class="led-badge" style="color: var(--yellow);">BLINK (0.5s)</span>
+          </div>
+          <div style="font-size: 0.73rem; color: var(--text-muted); background: rgba(0,0,0,0.2); padding: 6px 10px; border-radius: 6px;">
+            ℹ️ <b>LED Fisico Wi-Fi:</b> È il LED fisico sul circuito stampato che segnala lo stato di rete: <b>lampeggia a 0.5s</b> durante il pairing AP e diventa <b>acceso fisso</b> quando connesso al router.
           </div>
           <div class="led-actions">
             <button id="btnLed1On" class="btn-led-action" onclick="setLed(1, 'ON')">🟢 Accendi</button>
@@ -1588,12 +1597,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="led-header">
             <div class="led-title">
               <span id="led3Dot" class="led-indicator blink"></span>
-              <span>LED 3 <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">(TYWE1S Wi-Fi • PB4/PC13)</span></span>
+              <span>LED 3 <span style="font-size: 0.75rem; color: var(--text-muted); font-weight: 400;">(Modulo TYWE1S • Radio)</span></span>
             </div>
-            <span id="led3Badge" class="led-badge" style="color: var(--yellow);">BLINK 0.5s (In attesa)</span>
+            <span id="led3Badge" class="led-badge" style="color: var(--yellow);">IN ATTESA PAIRING</span>
           </div>
           <div style="font-size: 0.73rem; color: var(--text-muted); background: rgba(0,0,0,0.2); padding: 6px 10px; border-radius: 6px;">
-            ℹ️ <b>Regola Wi-Fi:</b> Fisso se connesso al Wi-Fi, lampeggia a 0.5s se disconnesso. Puoi sovrascriverlo manualmente qui sotto.
+            ℹ️ <b>Nota Protocollo Tuya:</b> Nel firmware di fabbrica originale Tuya, la segnalazione luminosa è delegata interamente all'STM32 tramite <b>LED 1 (PB6)</b> sopra riportato.
           </div>
           <div class="led-actions">
             <button id="btnLed3On" class="btn-led-action" onclick="setLed(3, 'ON')">🟢 Accendi</button>
@@ -2043,10 +2052,10 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
             wifiIp.innerText = data.wifi_ip;
             wifiIp.style.color = '#22c55e';
           } else if (data.wifi_connected) {
-            wifiIp.innerText = 'in attesa IP...';
+            wifiIp.innerText = 'connesso (acquisizione IP...)';
             wifiIp.style.color = '#eab308';
           } else {
-            wifiIp.innerText = 'non connesso';
+            wifiIp.innerText = 'non connesso (in attesa pairing app Tuya)';
             wifiIp.style.color = '#eab308';
           }
         }
@@ -2060,7 +2069,7 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
           }
         } else {
           if (wifiBadge) {
-            wifiBadge.innerText = 'Disconnesso / SoftAP';
+            wifiBadge.innerText = 'In attesa pairing app (SmartLife-xxxx)';
             wifiBadge.style.color = '#eab308';
           }
         }
@@ -2321,12 +2330,23 @@ curl http://&lt;IP&gt;:8080/api/temp</div>
         const d = await res.json();
         msgBox.style.display = 'block';
         if (d.ok) {
-          msgBox.style.background = 'rgba(34, 197, 94, 0.2)';
-          msgBox.style.color = '#22c55e';
-          msgBox.innerText = '✅ ' + d.message;
+          msgBox.style.background = 'rgba(56, 189, 248, 0.12)';
+          msgBox.style.color = '#fff';
+          msgBox.style.border = '1px solid rgba(56, 189, 248, 0.3)';
+          msgBox.innerHTML = `
+            <div style="font-weight: 700; color: var(--accent); margin-bottom: 8px;">📡 ${d.message}</div>
+            <div style="text-align: left; font-size: 0.78rem; line-height: 1.5; color: #e2e8f0;">
+              ℹ️ <i>Il firmware originale Tuya riceve la password via radio dallo smartphone (non via cavo USB).</i><br>
+              <b>Completa l'associazione in 30 secondi:</b><br>
+              1. Apri l'app <b>Tuya Smart</b> (o <b>Smart Life</b>) sul telefono (connesso a 2.4 GHz).<br>
+              2. Tocca <b>+</b> (Aggiungi) &gt; <i>Illuminazione</i> &gt; scegli in alto <b>Modalità AP (Hotspot)</b>.<br>
+              3. Conferma la password e connetti il Wi-Fi del telefono all'hotspot della scheda <b>SmartLife-xxxx</b>.<br>
+              4. Torna nell'app Tuya: il telefono passerà la password al modulo. Il LED1 diventerà <b>fisso</b> e l'IP LAN apparirà qui sotto!
+            </div>
+          `;
           const badge = document.getElementById('wifiBadge');
-          badge.innerText = 'Inviato: ' + ssid;
-          badge.style.color = '#22c55e';
+          badge.innerText = 'Pairing AP: ' + ssid;
+          badge.style.color = 'var(--yellow)';
         } else {
           msgBox.style.background = 'rgba(239, 68, 68, 0.2)';
           msgBox.style.color = '#ef4444';

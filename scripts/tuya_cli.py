@@ -85,6 +85,65 @@ def ping(
         sys.exit(2)
 
 
+@app.command(name="diag")
+def diag(
+    port: Annotated[
+        str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
+    ] = DEFAULT_PORT,
+    baud: Annotated[
+        int, Parameter(name=["-b", "--baud"], help="Baud rate")
+    ] = DEFAULT_BAUD,
+) -> None:
+    """Esegue diagnosi hardware pin PB11 (TYWE1S TX), test 9600 Tuya e 115200 ESP bootloader."""
+    print(f"[{get_timestamp()}] Avvio diagnostica hardware su {port} ({baud} baud)...")
+    try:
+        with serial.Serial(port, baud, timeout=3.0) as ser:
+            ser.reset_input_buffer()
+            ser.write(b"D\n")
+            ser.flush()
+            t0 = time.time()
+            while time.time() - t0 < 4.0:
+                line = ser.readline().decode("ascii", errors="replace")
+                if line:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    if "=== HARDWARE DIAGNOSTIC END ===" in line:
+                        break
+    except (serial.SerialException, OSError) as exc:
+        print(f"[-] Errore apertura porta seriale {port}: {exc}")
+        sys.exit(2)
+
+
+@app.command(name="sniff")
+def sniff(
+    port: Annotated[
+        str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
+    ] = DEFAULT_PORT,
+    baud: Annotated[
+        int, Parameter(name=["-b", "--baud"], help="Baud rate")
+    ] = DEFAULT_BAUD,
+) -> None:
+    """Attiva il Boot Sniffer ESP8266 a 74880 baud per 15s su STM32."""
+    print(f"[{get_timestamp()}] Avvio Boot Sniffer ESP8266 su {port}...")
+    try:
+        with serial.Serial(port, baud, timeout=0.1) as ser:
+            ser.reset_input_buffer()
+            ser.write(b"S\n")
+            ser.flush()
+            t0 = time.time()
+            while time.time() - t0 < 16.0:
+                data = ser.read(128)
+                if data:
+                    text = data.decode("ascii", errors="replace")
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                    if "=== SNIFFER END ===" in text:
+                        break
+    except (serial.SerialException, OSError) as exc:
+        print(f"[-] Errore apertura porta seriale {port}: {exc}")
+        sys.exit(2)
+
+
 @app.command(name="read-temp")
 def read_temp(
     port: Annotated[
@@ -404,6 +463,13 @@ def flash_pio(
     t0 = time.time()
     success = False
     while time.time() - t0 < attempts:
+        try:
+            with serial.Serial(port, DEFAULT_BAUD, timeout=0.05) as ser:
+                ser.write(b"B")
+                ser.flush()
+                time.sleep(0.05)
+        except (serial.SerialException, OSError):
+            pass
         res = subprocess.run(cmd, check=False)
         if res.returncode == 0:
             success = True
@@ -435,6 +501,9 @@ def restore_factory(
     port: Annotated[
         str, Parameter(name=["-p", "--port"], help="Porta seriale COM")
     ] = DEFAULT_PORT,
+    attempts: Annotated[
+        int, Parameter(name=["-a", "--attempts"], help="Finestra tentativi (secondi)")
+    ] = 45,
 ) -> None:
     """Ripristina il firmware di fabbrica originale Tuya su STM32."""
     bin_file = FIRMWARE_DIR / "stm32_factory_tuya_backup.bin"
@@ -454,10 +523,41 @@ def restore_factory(
         "-v",
         str(bin_file),
     ]
-    print(f"[{get_timestamp()}] Ripristino firmware di fabbrica Tuya su STM32...")
-    res = subprocess.run(cmd, check=False)
-    if res.returncode != 0:
-        sys.exit(res.returncode)
+    print(
+        f"[{get_timestamp()}] Ripristino firmware di fabbrica Tuya su STM32 ({attempts}s finestra)..."
+    )
+    print(
+        "  [👉 Tieni premuto S2: MCU BOOT, clicca S1: MCU RST, poi rilascia S2: MCU BOOT]"
+    )
+
+    t0 = time.time()
+    success = False
+    while time.time() - t0 < attempts:
+        res = subprocess.run(cmd, check=False)
+        if res.returncode == 0:
+            success = True
+            break
+        time.sleep(0.5)
+
+    if not success:
+        print("[-] Timeout connessione bootloader STM32.")
+        sys.exit(1)
+
+    print(
+        f"[{get_timestamp()}] Ripristino di fabbrica completato con successo! Avvio applicazione..."
+    )
+    boot_cmd = [
+        sys.executable,
+        "-m",
+        "stm32loader",
+        "-p",
+        port,
+        "-f",
+        "F1",
+        "-g",
+        "0x08000000",
+    ]
+    subprocess.run(boot_cmd, check=False)
 
 
 @app.command(name="backup-esp")
@@ -474,6 +574,16 @@ def backup_esp(
 ) -> None:
     """Esegue dump completo di 2 MiB della memoria flash del TYWE1S via esptool."""
     out_file = FIRMWARE_DIR / "tywe1s_factory_tuya_backup.bin"
+
+    # Attiva la modalità Passthrough pura su STM32 (Serial3 <-> Serial @ 115200)
+    try:
+        with serial.Serial(port, baud, timeout=0.1) as ser:
+            ser.write(b"P\n")
+            ser.flush()
+            time.sleep(0.05)
+    except (serial.SerialException, OSError):
+        pass
+
     cmd = [
         sys.executable,
         "-m",
@@ -490,7 +600,7 @@ def backup_esp(
         "no-reset",
         "--connect-attempts",
         str(attempts),
-        "read_flash",
+        "read-flash",
         "0",
         "0x200000",
         str(out_file),
@@ -499,7 +609,7 @@ def backup_esp(
         f"[{get_timestamp()}] Avvio backup flash TYWE1S (ESP8266, 2 MiB) su {out_file}..."
     )
     print(
-        ">>> SUGGERIMENTO: Mentre esptool tenta la connessione, tieni premuto WIFI BOOT e clicca WIFI RST!"
+        ">>> SUGGERIMENTO: Mentre esptool tenta la connessione, tieni premuto S3: WIFI BOOT e clicca S4: WIFI RST!"
     )
     res = subprocess.run(cmd, check=False)
     if res.returncode != 0:
@@ -516,13 +626,23 @@ def flash_esp(
     ] = DEFAULT_BAUD,
     attempts: Annotated[
         int, Parameter(name=["-a", "--attempts"], help="Tentativi di connessione")
-    ] = 30,
+    ] = 120,
 ) -> None:
     """Carica il firmware Wi-Fi C++ PlatformIO (tywe1s_wifi_firmware.bin) sul modulo TYWE1S via esptool."""
     bin_file = FIRMWARE_DIR / "tywe1s_wifi_firmware.bin"
     if not bin_file.exists():
         print(f"[-] File binario non trovato: {bin_file}")
         sys.exit(1)
+
+    # Attiva la modalità Passthrough pura su STM32 (Serial3 <-> Serial @ 115200)
+    try:
+        with serial.Serial(port, baud, timeout=0.1) as ser:
+            ser.write(b"P\n")
+            ser.flush()
+            time.sleep(0.05)
+    except (serial.SerialException, OSError):
+        pass
+
     cmd = [
         sys.executable,
         "-m",
@@ -539,7 +659,9 @@ def flash_esp(
         "no-reset",
         "--connect-attempts",
         str(attempts),
-        "write_flash",
+        "write-flash",
+        "--flash-size",
+        "detect",
         "0x0",
         str(bin_file),
     ]
